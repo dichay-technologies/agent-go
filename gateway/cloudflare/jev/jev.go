@@ -29,9 +29,9 @@ func (d Dialect) BuildRequest(model string, req gateway.Request) (string, map[st
 
 	questions := make(map[string]wireQuestion)
 
-	// 1. If Tools are provided, create a "tool" choice question.
+	// 1. If Tools are provided, create a "tool" choice question with a "none" escape hatch.
 	if len(req.Tools) > 0 {
-		crit := make(map[string]any, len(req.Tools))
+		crit := make(map[string]any, len(req.Tools)+1)
 		for _, t := range req.Tools {
 			if t.Description != "" {
 				crit[t.Name] = t.Description
@@ -39,9 +39,12 @@ func (d Dialect) BuildRequest(model string, req gateway.Request) (string, map[st
 				crit[t.Name] = nil
 			}
 		}
+		if _, exists := crit["none"]; !exists {
+			crit["none"] = "No tool needed; reply directly in plain text."
+		}
 		questions["tool"] = wireQuestion{
 			Type:         "choice",
-			Instructions: "Select the best tool for the current state.",
+			Instructions: "Select the best tool for the current state, or \"none\" if no tool is needed.",
 			Criteria:     crit,
 		}
 	}
@@ -104,8 +107,8 @@ func (d Dialect) ParseResponse(model string, raw []byte) (gateway.Response, erro
 		},
 	}
 
-	// Map "tool" choice answer into ToolCalls if present.
-	if toolAns, ok := parsed.Answers["tool"]; ok && toolAns.Type == "choice" && toolAns.Choice != "" {
+	// Map "tool" choice answer into ToolCalls if present (ignoring "none").
+	if toolAns, ok := parsed.Answers["tool"]; ok && toolAns.Type == "choice" && toolAns.Choice != "" && toolAns.Choice != "none" {
 		out.ToolCalls = []gateway.ToolCall{{
 			ID:        "jev_tool_0",
 			Name:      toolAns.Choice,

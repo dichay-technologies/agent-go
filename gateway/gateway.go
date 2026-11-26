@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"iter"
 	"sync"
 	"time"
 )
@@ -22,6 +23,14 @@ type Config struct {
 	EnableCache bool
 	// CacheTTL sets how long cached responses remain valid. Zero means no expiration.
 	CacheTTL time.Duration
+	// MaxCacheEntries caps the default in-memory cache size. Zero defaults to 1024.
+	MaxCacheEntries int
+	// Cache overrides the default in-memory Cache when EnableCache is true.
+	Cache Cache
+	// UsageSink receives token usage records for custom accounting.
+	UsageSink UsageSink
+	// UsageKey derives the accounting key for UsageByProject / AllUsage. Defaults to req.ProjectID.
+	UsageKey func(Request) string
 	// CoalesceWindow enables cross-project micro-batching for requests with Coalesce=true
 	// when > 0 (recommended: 50ms - 150ms).
 	CoalesceWindow time.Duration
@@ -53,9 +62,6 @@ type AIGateway struct {
 	usageMu sync.RWMutex
 	usage   map[string]Usage
 
-	cacheMu sync.RWMutex
-	cache   map[string]cacheEntry
-
 	flightMu sync.Mutex
 	flights  map[string]*inFlightCall
 
@@ -63,15 +69,13 @@ type AIGateway struct {
 	batches map[batchKey]*pendingBatch
 }
 
-type cacheEntry struct {
-	resp      Response
-	expiresAt time.Time
-}
-
 type inFlightCall struct {
-	done chan struct{}
-	resp Response
-	err  error
+	done    chan struct{}
+	resp    Response
+	err     error
+	mu      sync.Mutex
+	waiters int
+	cancel  context.CancelFunc
 }
 
 type batchKey struct {
@@ -101,6 +105,12 @@ func New(cfg Config) *AIGateway {
 	if cfg.MaxBatchSize <= 0 {
 		cfg.MaxBatchSize = 32
 	}
+	if cfg.MaxCacheEntries <= 0 {
+		cfg.MaxCacheEntries = 1024
+	}
+	if cfg.EnableCache && cfg.Cache == nil {
+		cfg.Cache = NewMemoryCache(cfg.MaxCacheEntries)
+	}
 	router := cfg.Router
 	if router == nil {
 		router = NewTableRouter()
@@ -110,7 +120,6 @@ func New(cfg Config) *AIGateway {
 		router:    router,
 		providers: make(map[string]Provider),
 		usage:     make(map[string]Usage),
-		cache:     make(map[string]cacheEntry),
 		flights:   make(map[string]*inFlightCall),
 		batches:   make(map[batchKey]*pendingBatch),
 	}
@@ -194,7 +203,7 @@ func (g *AIGateway) completeCore(ctx context.Context, req Request) (Response, er
 
 	// 1. Content-addressed cache lookup.
 	if g.cfg.EnableCache && !req.BypassCache {
-		if resp, ok := g.cacheGet(key); ok {
+		if resp, ok := g.cacheGet(ctx, key); ok {
 			resp.Cached = true
 			return resp, nil
 		}
@@ -202,54 +211,78 @@ func (g *AIGateway) completeCore(ctx context.Context, req Request) (Response, er
 
 	// 2. Singleflight deduplication for identical concurrent requests.
 	g.flightMu.Lock()
-	if call, ok := g.flights[key]; ok {
+	call, joined := g.flights[key]
+	if joined {
+		call.mu.Lock()
+		call.waiters++
+		call.mu.Unlock()
 		g.flightMu.Unlock()
-		select {
-		case <-call.done:
-			if call.err == nil && req.ProjectID != "" {
-				g.recordUsage(req.ProjectID, call.resp.Usage)
-			}
-			return call.resp, call.err
-		case <-ctx.Done():
-			return Response{}, ctx.Err()
-		}
-	}
-	call := &inFlightCall{done: make(chan struct{})}
-	g.flights[key] = call
-	g.flightMu.Unlock()
-
-	defer func() {
-		g.flightMu.Lock()
-		delete(g.flights, key)
-		g.flightMu.Unlock()
-		close(call.done)
-	}()
-
-	// 3. Execute directly or via cross-project coalescing window.
-	var resp Response
-	if g.shouldCoalesce(req) {
-		resp, err = g.enqueueCoalesced(ctx, prov, req)
 	} else {
-		resp, err = prov.Complete(ctx, req)
-	}
-
-	if err == nil && req.ResponseSchema != nil && len(resp.ToolCalls) == 0 {
-		if verr := req.ResponseSchema.Validate(json.RawMessage(resp.Text)); verr != nil {
-			err = fmt.Errorf("gateway: response schema validation failed: %w", verr)
+		flightCtx, cancelFlight := context.WithCancel(context.WithoutCancel(ctx))
+		call = &inFlightCall{
+			done:    make(chan struct{}),
+			waiters: 1,
+			cancel:  cancelFlight,
 		}
+		g.flights[key] = call
+		g.flightMu.Unlock()
+
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					call.resp = Response{}
+					call.err = fmt.Errorf("gateway: panic in provider %q: %v", prov.Name(), r)
+				}
+				cancelFlight()
+				g.flightMu.Lock()
+				delete(g.flights, key)
+				g.flightMu.Unlock()
+				close(call.done)
+			}()
+
+			// 3. Execute directly or via cross-project coalescing window.
+			var resp Response
+			var callErr error
+			if g.shouldCoalesce(req) {
+				resp, callErr = g.enqueueCoalesced(flightCtx, prov, req)
+			} else {
+				resp, callErr = prov.Complete(flightCtx, req)
+			}
+
+			if callErr == nil && req.ResponseSchema != nil && len(resp.ToolCalls) == 0 {
+				if verr := req.ResponseSchema.Validate(json.RawMessage(resp.Text)); verr != nil {
+					callErr = fmt.Errorf("gateway: response schema validation failed: %w", verr)
+				}
+			}
+
+			call.resp = resp
+			call.err = callErr
+
+			if callErr == nil && g.cfg.EnableCache && !req.BypassCache {
+				g.cachePut(flightCtx, key, resp)
+			}
+		}()
 	}
 
-	call.resp = resp
-	call.err = err
-
-	if err == nil {
-		g.recordUsage(req.ProjectID, resp.Usage)
-		if g.cfg.EnableCache && !req.BypassCache {
-			g.cachePut(key, resp)
+	select {
+	case <-call.done:
+		if call.err == nil {
+			if !joined || req.ProjectID != "" || len(req.Meta) > 0 {
+				g.recordUsage(ctx, req, call.resp.Usage)
+			}
 		}
+		return call.resp, call.err
+	case <-ctx.Done():
+		call.mu.Lock()
+		call.waiters--
+		shouldCancel := call.waiters == 0 && call.cancel != nil
+		cancelFn := call.cancel
+		call.mu.Unlock()
+		if shouldCancel {
+			cancelFn()
+		}
+		return Response{}, ctx.Err()
 	}
-
-	return resp, err
 }
 
 func (g *AIGateway) resolveProvider(ctx context.Context, req Request) (Provider, string, error) {
@@ -352,7 +385,9 @@ func (g *AIGateway) executeBatch(items []*batchItem, prov Provider) {
 		for i, it := range active {
 			reqs[i] = it.req
 		}
-		resps, errs := bp.BatchComplete(context.Background(), reqs)
+		batchCtx, cancelBatch := mergeBatchContext(active)
+		defer cancelBatch()
+		resps, errs := bp.BatchComplete(batchCtx, reqs)
 		for i, it := range active {
 			var r Response
 			var e error
@@ -379,41 +414,94 @@ func (g *AIGateway) executeBatch(items []*batchItem, prov Provider) {
 	wg.Wait()
 }
 
-func (g *AIGateway) recordUsage(projectID string, u Usage) {
-	if projectID == "" {
-		projectID = "_default"
+func mergeBatchContext(items []*batchItem) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		for _, it := range items {
+			select {
+			case <-it.ctx.Done():
+			case <-done:
+				return
+			}
+		}
+		cancel()
+	}()
+	return ctx, func() {
+		close(done)
+		cancel()
+	}
+}
+
+// Stream dispatches a streaming request to the routed provider if it implements StreamProvider,
+// otherwise falls back to Complete and yields a single chunk.
+func (g *AIGateway) Stream(ctx context.Context, req Request) iter.Seq2[StreamChunk, error] {
+	return func(yield func(StreamChunk, error) bool) {
+		prov, resolvedModel, err := g.resolveProvider(ctx, req)
+		if err != nil {
+			yield(StreamChunk{}, err)
+			return
+		}
+		req.Provider = prov.Name()
+		req.Model = resolvedModel
+
+		if sp, ok := prov.(StreamProvider); ok {
+			for chunk, err := range sp.Stream(ctx, req) {
+				if err == nil && chunk.Usage != nil {
+					g.recordUsage(ctx, req, *chunk.Usage)
+				}
+				if !yield(chunk, err) || err != nil {
+					return
+				}
+			}
+			return
+		}
+
+		resp, err := g.Complete(ctx, req)
+		if err != nil {
+			yield(StreamChunk{}, err)
+			return
+		}
+		u := resp.Usage
+		yield(StreamChunk{
+			Text:      resp.Text,
+			ToolCalls: resp.ToolCalls,
+			Usage:     &u,
+			Done:      true,
+		}, nil)
+	}
+}
+
+func (g *AIGateway) recordUsage(ctx context.Context, req Request, u Usage) {
+	if g.cfg.UsageSink != nil {
+		g.cfg.UsageSink.Record(ctx, req, u)
+	}
+	key := req.ProjectID
+	if g.cfg.UsageKey != nil {
+		key = g.cfg.UsageKey(req)
+	}
+	if key == "" {
+		key = "_default"
 	}
 	g.usageMu.Lock()
-	cur := g.usage[projectID]
+	cur := g.usage[key]
 	cur.Add(u)
-	g.usage[projectID] = cur
+	g.usage[key] = cur
 	g.usageMu.Unlock()
 }
 
-func (g *AIGateway) cacheGet(key string) (Response, bool) {
-	g.cacheMu.RLock()
-	entry, ok := g.cache[key]
-	g.cacheMu.RUnlock()
-	if !ok {
+func (g *AIGateway) cacheGet(ctx context.Context, key string) (Response, bool) {
+	if g.cfg.Cache == nil {
 		return Response{}, false
 	}
-	if !entry.expiresAt.IsZero() && time.Now().After(entry.expiresAt) {
-		g.cacheMu.Lock()
-		delete(g.cache, key)
-		g.cacheMu.Unlock()
-		return Response{}, false
-	}
-	return entry.resp, true
+	return g.cfg.Cache.Get(ctx, key)
 }
 
-func (g *AIGateway) cachePut(key string, resp Response) {
-	var exp time.Time
-	if g.cfg.CacheTTL > 0 {
-		exp = time.Now().Add(g.cfg.CacheTTL)
+func (g *AIGateway) cachePut(ctx context.Context, key string, resp Response) {
+	if g.cfg.Cache == nil {
+		return
 	}
-	g.cacheMu.Lock()
-	g.cache[key] = cacheEntry{resp: resp, expiresAt: exp}
-	g.cacheMu.Unlock()
+	g.cfg.Cache.Set(ctx, key, resp, g.cfg.CacheTTL)
 }
 
 func hashRequest(req Request) string {

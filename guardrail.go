@@ -11,21 +11,63 @@ const defaultMaxAttempts = 3
 
 // AttemptLog records a single failed attempt for escalation diagnostics.
 type AttemptLog struct {
-	Attempt int
-	StepID  string
-	Error   string
+	Attempt int    `json:"attempt"`
+	StepID  string `json:"step_id"`
+	Error   string `json:"error"`
+}
+
+// FailureAction specifies how the agent should handle an unrecoverable step failure.
+type FailureAction int
+
+const (
+	// FailureFail fails the step and transitions the run to StatusFailed (default).
+	FailureFail FailureAction = iota
+	// FailureSkip skips the failed step with nil output and continues the run.
+	FailureSkip
+	// FailureFallback substitutes FailureDecision.Value as the step's output.
+	FailureFallback
+)
+
+// FailureDecision is returned by a FailurePolicy when a step fails after escalation.
+type FailureDecision struct {
+	Action FailureAction
+	Value  any
+	Err    error
+}
+
+// FailurePolicy decides what to do when a step fails all attempts and escalation.
+type FailurePolicy func(ctx Context, stepID string, history []AttemptLog, err error) FailureDecision
+
+// FailOnError is the default FailurePolicy that fails the step with err.
+func FailOnError(_ Context, _ string, _ []AttemptLog, err error) FailureDecision {
+	return FailureDecision{Action: FailureFail, Err: err}
+}
+
+// SkipOnError is a FailurePolicy that skips failed steps and continues execution.
+func SkipOnError(_ Context, _ string, _ []AttemptLog, _ error) FailureDecision {
+	return FailureDecision{Action: FailureSkip}
+}
+
+// FallbackValue returns a FailurePolicy that substitutes val when a step fails.
+func FallbackValue(val any) FailurePolicy {
+	return func(_ Context, _ string, _ []AttemptLog, _ error) FailureDecision {
+		return FailureDecision{Action: FailureFallback, Value: val}
+	}
 }
 
 // RunWithGuardrail executes stepFn up to maxAttempts (default 3) times.
-// If all attempts fail, it transitions the agent to StatusEscalated, invokes
+// If all attempts fail, it transitions the run to StatusEscalated, invokes
 // Hooks.OnEscalate, and gives the escalation model one chance to recover.
-// If escalation also fails, it transitions to StatusFailed and invokes Hooks.OnFail.
+// If escalation also fails, FailurePolicy decides whether to fail, skip, or fallback.
 func RunWithGuardrail[S any](
 	ctx Context,
 	a *AI[S],
 	stepID string,
 	stepFn func(attempt int, lastErr error) (any, error),
 ) (any, error) {
+	sess := sessionFromContext(ctx, a)
+	mem := a.memoryFor(sess)
+
 	maxAttempts := a.MaxAttempts
 	if maxAttempts <= 0 {
 		maxAttempts = defaultMaxAttempts
@@ -33,12 +75,12 @@ func RunWithGuardrail[S any](
 
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		a.setState(StatusExecuting, stepID, attempt)
+		sess.setState(StatusExecuting, stepID, attempt)
 		out, err := stepFn(attempt, lastErr)
 		if err == nil {
-			a.setState(StatusVerifying, stepID, attempt)
+			sess.setState(StatusVerifying, stepID, attempt)
 			if a.Hooks.OnVerify != nil {
-				if verr := a.Hooks.OnVerify(ctx, a.Memory, out); verr != nil {
+				if verr := a.Hooks.OnVerify(ctx, mem, out); verr != nil {
 					err = verr
 				}
 			}
@@ -48,7 +90,7 @@ func RunWithGuardrail[S any](
 		}
 
 		lastErr = err
-		a.appendAttemptLog(AttemptLog{
+		sess.appendAttemptLog(AttemptLog{
 			Attempt: attempt,
 			StepID:  stepID,
 			Error:   err.Error(),
@@ -56,12 +98,11 @@ func RunWithGuardrail[S any](
 	}
 
 	// Escalate after maxAttempts failures.
-	a.setState(StatusEscalated, stepID, maxAttempts)
-	history := a.attemptHistory()
+	sess.setState(StatusEscalated, stepID, maxAttempts)
+	history := sess.attemptHistory()
 	if a.Hooks.OnEscalate != nil {
-		if herr := a.Hooks.OnEscalate(ctx, a.Memory, history); herr != nil {
-			a.fail(ctx, herr)
-			return nil, herr
+		if herr := a.Hooks.OnEscalate(ctx, mem, history); herr != nil {
+			return applyFailurePolicy(ctx, a, sess, stepID, history, herr)
 		}
 	}
 
@@ -79,7 +120,7 @@ func RunWithGuardrail[S any](
 		"StepID":   stepID,
 		"Attempts": maxAttempts,
 		"History":  histBuf.String(),
-		"Task":     a.Task,
+		"Task":     sess.task(),
 	})
 	if err != nil {
 		escPrompt = fmt.Sprintf("Step %q failed %d times:\n%s", stepID, maxAttempts, histBuf.String())
@@ -94,18 +135,51 @@ func RunWithGuardrail[S any](
 	})
 	if escErr != nil {
 		finalErr := fmt.Errorf("guardrail: escalation failed after %d attempts (%v): %w", maxAttempts, lastErr, escErr)
-		a.fail(ctx, finalErr)
-		return nil, finalErr
+		return applyFailurePolicy(ctx, a, sess, stepID, history, finalErr)
 	}
 
 	if a.Hooks.OnVerify != nil {
-		if verr := a.Hooks.OnVerify(ctx, a.Memory, resp.Text); verr != nil {
+		if verr := a.Hooks.OnVerify(ctx, mem, resp.Text); verr != nil {
 			finalErr := fmt.Errorf("guardrail: escalated output rejected: %w", verr)
-			a.fail(ctx, finalErr)
-			return nil, finalErr
+			return applyFailurePolicy(ctx, a, sess, stepID, history, finalErr)
 		}
 	}
 
 	return resp.Text, nil
 }
 
+func applyFailurePolicy[S any](
+	ctx Context,
+	a *AI[S],
+	sess *runSession[S],
+	stepID string,
+	history []AttemptLog,
+	err error,
+) (any, error) {
+	action := FailureFail
+	var fallbackVal any
+	if a.FailurePolicy != nil {
+		decision := a.FailurePolicy(ctx, stepID, history, err)
+		action = decision.Action
+		fallbackVal = decision.Value
+		if action == FailureFail && decision.Err != nil {
+			err = decision.Err
+		}
+	}
+	sess.appendFailureRecord(FailureRecord{
+		StepID:   stepID,
+		Attempts: len(history),
+		Error:    err.Error(),
+		Action:   action,
+		History:  history,
+	})
+	switch action {
+	case FailureSkip:
+		return nil, nil
+	case FailureFallback:
+		return fallbackVal, nil
+	default:
+		a.failSession(ctx, sess, err)
+		return nil, err
+	}
+}

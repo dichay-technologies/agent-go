@@ -175,3 +175,37 @@ func TestOpenAIDirectVoiceIO(t *testing.T) {
 	}
 }
 
+func TestOpenAISSEStream(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(
+			"data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n" +
+				"data: {\"choices\":[{\"delta\":{\"content\":\"lo!\",\"tool_calls\":[{\"index\":0,\"id\":\"tc1\",\"function\":{\"name\":\"ping\",\"arguments\":\"{\\\"x\\\":1}\"}}]}}]}\n\n" +
+				"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":3,\"prompt_tokens_details\":{\"cached_tokens\":2}}}\n\n" +
+				"data: [DONE]\n\n",
+		))
+	}))
+	defer srv.Close()
+
+	p, err := openai.New(openai.Config{APIKey: "sk-test", BaseURL: srv.URL})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	var text string
+	var calls []gateway.ToolCall
+	var usage *gateway.Usage
+	for ch, serr := range p.Stream(context.Background(), gateway.Request{Messages: []gateway.Message{{Role: gateway.MsgUser, Content: "hi"}}}) {
+		if serr != nil {
+			t.Fatalf("Stream err: %v", serr)
+		}
+		text += ch.Text
+		calls = append(calls, ch.ToolCalls...)
+		if ch.Usage != nil {
+			usage = ch.Usage
+		}
+	}
+	if text != "Hello!" || len(calls) != 1 || calls[0].Name != "ping" || usage == nil || usage.InputTokens != 8 {
+		t.Fatalf("unexpected stream output: text=%q calls=%+v usage=%+v", text, calls, usage)
+	}
+}
+

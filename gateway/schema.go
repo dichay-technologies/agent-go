@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"slices"
+	"reflect"
 	"strings"
 )
 
@@ -151,9 +151,142 @@ func jsonEqual(a, b any) bool {
 		bb, okB := b.(bool)
 		return okB && ba == bb
 	}
-	if slices.Contains([]any{a}, b) {
-		return true
+	return reflect.DeepEqual(a, b)
+}
+
+// OpenAINormalize returns a shallow/deep copy normalized for OpenAI response_format
+// and reports whether strict mode is valid (all object properties listed in Required).
+func (s *JSONSchema) OpenAINormalize() (*JSONSchema, bool) {
+	if s == nil {
+		return nil, false
 	}
-	return fmt.Sprint(a) == fmt.Sprint(b)
+	cp := *s
+	strictOK := true
+	if cp.Type == "object" {
+		reqSet := make(map[string]bool, len(cp.Required))
+		for _, r := range cp.Required {
+			reqSet[r] = true
+		}
+		if len(cp.Properties) > 0 {
+			props := make(map[string]*JSONSchema, len(cp.Properties))
+			for k, v := range cp.Properties {
+				if !reqSet[k] {
+					strictOK = false
+				}
+				child, childStrict := v.OpenAINormalize()
+				if !childStrict {
+					strictOK = false
+				}
+				props[k] = child
+			}
+			cp.Properties = props
+		}
+		if strictOK && cp.AdditionalProperties == nil {
+			f := false
+			cp.AdditionalProperties = &f
+		}
+	} else if cp.Type == "array" && cp.Items != nil {
+		child, childStrict := cp.Items.OpenAINormalize()
+		cp.Items = child
+		if !childStrict {
+			strictOK = false
+		}
+	}
+	return &cp, strictOK
+}
+
+// SchemaFor generates a JSONSchema from a Go type T using reflection.
+// It inspects `json` tags for field names and `omitempty` (to omit from Required),
+// and `desc` or `description` tags for field descriptions.
+func SchemaFor[T any]() *JSONSchema {
+	var zero T
+	t := reflect.TypeOf(zero)
+	if t == nil {
+		return &JSONSchema{Type: "object"}
+	}
+	return schemaForType(t, map[reflect.Type]bool{})
+}
+
+func schemaForType(t reflect.Type, seen map[reflect.Type]bool) *JSONSchema {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+
+	switch t.Kind() {
+	case reflect.String:
+		return &JSONSchema{Type: "string"}
+	case reflect.Bool:
+		return &JSONSchema{Type: "boolean"}
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return &JSONSchema{Type: "integer"}
+	case reflect.Float32, reflect.Float64:
+		return &JSONSchema{Type: "number"}
+	case reflect.Slice, reflect.Array:
+		if t.Elem().Kind() == reflect.Uint8 && t.Kind() == reflect.Slice {
+			return &JSONSchema{Type: "string"}
+		}
+		return &JSONSchema{
+			Type:  "array",
+			Items: schemaForType(t.Elem(), seen),
+		}
+	case reflect.Map:
+		return &JSONSchema{Type: "object"}
+	case reflect.Interface:
+		return &JSONSchema{}
+	case reflect.Struct:
+		if seen[t] {
+			return &JSONSchema{Type: "object"}
+		}
+		seen[t] = true
+		defer delete(seen, t)
+
+		props := make(map[string]*JSONSchema)
+		var required []string
+
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			if !f.IsExported() {
+				continue
+			}
+			jsonTag := f.Tag.Get("json")
+			if jsonTag == "-" {
+				continue
+			}
+			name := f.Name
+			omitEmpty := false
+			if jsonTag != "" {
+				parts := strings.Split(jsonTag, ",")
+				if parts[0] != "" {
+					name = parts[0]
+				}
+				for _, opt := range parts[1:] {
+					if opt == "omitempty" || opt == "omitzero" {
+						omitEmpty = true
+					}
+				}
+			}
+
+			propSchema := schemaForType(f.Type, seen)
+			if desc := f.Tag.Get("description"); desc != "" {
+				propSchema.Description = desc
+			} else if desc := f.Tag.Get("desc"); desc != "" {
+				propSchema.Description = desc
+			}
+
+			props[name] = propSchema
+			if !omitEmpty && f.Type.Kind() != reflect.Pointer {
+				required = append(required, name)
+			}
+		}
+
+		return &JSONSchema{
+			Type:       "object",
+			Properties: props,
+			Required:   required,
+		}
+	default:
+		return &JSONSchema{Type: "object"}
+	}
 }
 

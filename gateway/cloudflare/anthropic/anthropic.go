@@ -46,7 +46,7 @@ func (d Dialect) BuildRequest(model string, req gateway.Request) (string, map[st
 	}
 	type antMsg struct {
 		Role    string `json:"role"`
-		Content string `json:"content"`
+		Content any    `json:"content"`
 	}
 
 	var sysBlocks []systemBlock
@@ -64,11 +64,38 @@ func (d Dialect) BuildRequest(model string, req gateway.Request) (string, map[st
 			sysBlocks = append(sysBlocks, systemBlock{Type: "text", Text: m.Content})
 			continue
 		}
-		role := string(m.Role)
 		if m.Role == gateway.MsgTool {
-			role = "user"
+			msgs = append(msgs, antMsg{
+				Role: "user",
+				Content: []map[string]any{{
+					"type":        "tool_result",
+					"tool_use_id": m.ToolCallID,
+					"content":     m.Content,
+				}},
+			})
+			continue
 		}
-		msgs = append(msgs, antMsg{Role: role, Content: m.Content})
+		if len(m.ToolCalls) > 0 {
+			blocks := make([]map[string]any, 0, 1+len(m.ToolCalls))
+			if m.Content != "" {
+				blocks = append(blocks, map[string]any{"type": "text", "text": m.Content})
+			}
+			for _, tc := range m.ToolCalls {
+				input := tc.Arguments
+				if len(input) == 0 {
+					input = json.RawMessage(`{}`)
+				}
+				blocks = append(blocks, map[string]any{
+					"type":  "tool_use",
+					"id":    tc.ID,
+					"name":  tc.Name,
+					"input": input,
+				})
+			}
+			msgs = append(msgs, antMsg{Role: "assistant", Content: blocks})
+			continue
+		}
+		msgs = append(msgs, antMsg{Role: string(m.Role), Content: m.Content})
 	}
 
 	payload := struct {

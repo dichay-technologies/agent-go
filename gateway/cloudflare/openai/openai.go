@@ -45,12 +45,13 @@ func (d Dialect) BuildRequest(model string, req gateway.Request) (string, map[st
 		}
 	}
 	if req.ResponseSchema != nil {
+		normSchema, strictOK := req.ResponseSchema.OpenAINormalize()
 		payload.ResponseFormat = &responseFormat{
 			Type: "json_schema",
 			JSONSchema: &jsonSchemaSpec{
 				Name:   "response",
-				Strict: true,
-				Schema: req.ResponseSchema,
+				Strict: strictOK,
+				Schema: normSchema,
 			},
 		}
 	}

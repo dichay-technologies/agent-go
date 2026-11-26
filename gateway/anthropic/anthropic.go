@@ -8,8 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"math/rand/v2"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +38,11 @@ type APIError struct {
 
 func (e *APIError) Error() string {
 	return fmt.Sprintf("anthropic: HTTP %d: %s", e.Status, e.Body)
+}
+
+// Unwrap exposes typed gateway.ProviderError categories (ErrRateLimit, ErrRetryable, ErrAuth, ErrContextLength).
+func (e *APIError) Unwrap() error {
+	return gateway.ClassifyStatusCode("anthropic", e.Status, e.Body)
 }
 
 // Retryable reports whether the error (429, 529, 5xx) should be retried.
@@ -69,6 +76,9 @@ type Provider struct {
 
 // New creates a standalone Anthropic Provider.
 func New(cfg Config) (*Provider, error) {
+	if cfg.APIKey == "" {
+		cfg.APIKey = os.Getenv("ANTHROPIC_API_KEY")
+	}
 	if cfg.APIKey == "" {
 		return nil, fmt.Errorf("anthropic: APIKey is required")
 	}
@@ -128,6 +138,159 @@ func (p *Provider) Complete(ctx context.Context, req gateway.Request) (gateway.R
 		return gateway.Response{}, err
 	}
 	return p.dialect.ParseResponse(model, raw)
+}
+
+// Stream implements gateway.StreamProvider over Anthropic Messages SSE (stream=true).
+func (p *Provider) Stream(ctx context.Context, req gateway.Request) iter.Seq2[gateway.StreamChunk, error] {
+	return func(yield func(gateway.StreamChunk, error) bool) {
+		model := req.Model
+		if model == "" {
+			model = p.cfg.DefaultModel
+		}
+		suffix, headers, body, err := p.dialect.BuildRequest(model, req)
+		if err != nil {
+			yield(gateway.StreamChunk{}, fmt.Errorf("anthropic: build stream request: %w", err))
+			return
+		}
+		var bodyMap map[string]any
+		if err := json.Unmarshal(body, &bodyMap); err != nil {
+			yield(gateway.StreamChunk{}, err)
+			return
+		}
+		bodyMap["stream"] = true
+		streamBody, _ := json.Marshal(bodyMap)
+
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/"+strings.TrimLeft(suffix, "/"), bytes.NewReader(streamBody))
+		if err != nil {
+			yield(gateway.StreamChunk{}, fmt.Errorf("anthropic: create stream request: %w", err))
+			return
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Accept", "text/event-stream")
+		for k, v := range headers {
+			httpReq.Header.Set(k, v)
+		}
+
+		res, err := p.httpClient.Do(httpReq)
+		if err != nil {
+			yield(gateway.StreamChunk{}, fmt.Errorf("anthropic: stream request failed: %w", err))
+			return
+		}
+		defer res.Body.Close()
+
+		if res.StatusCode < 200 || res.StatusCode >= 300 {
+			errBody, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+			yield(gateway.StreamChunk{}, &APIError{Status: res.StatusCode, Body: strings.TrimSpace(string(errBody))})
+			return
+		}
+
+		type antAccTool struct {
+			id   string
+			name string
+			args strings.Builder
+		}
+		toolsByIdx := make(map[int]*antAccTool)
+		maxIdx := -1
+		var usage gateway.Usage
+		var hasUsage bool
+
+		for ev, sseErr := range gateway.ReadSSE(res.Body) {
+			if sseErr != nil {
+				yield(gateway.StreamChunk{}, sseErr)
+				return
+			}
+			data := strings.TrimSpace(ev.Data)
+			if data == "" {
+				continue
+			}
+			var frame struct {
+				Type    string `json:"type"`
+				Index   int    `json:"index"`
+				Message *struct {
+					Usage struct {
+						InputTokens          int64 `json:"input_tokens"`
+						CacheReadInputTokens int64 `json:"cache_read_input_tokens"`
+					} `json:"usage"`
+				} `json:"message"`
+				ContentBlock *struct {
+					Type string `json:"type"`
+					ID   string `json:"id"`
+					Name string `json:"name"`
+				} `json:"content_block"`
+				Delta *struct {
+					Type        string `json:"type"`
+					Text        string `json:"text"`
+					PartialJSON string `json:"partial_json"`
+				} `json:"delta"`
+				Usage *struct {
+					OutputTokens int64 `json:"output_tokens"`
+				} `json:"usage"`
+			}
+			if json.Unmarshal([]byte(data), &frame) != nil {
+				continue
+			}
+			switch frame.Type {
+			case "message_start":
+				if frame.Message != nil {
+					usage.InputTokens = frame.Message.Usage.InputTokens
+					usage.CachedTokens = frame.Message.Usage.CacheReadInputTokens
+					hasUsage = true
+				}
+			case "content_block_start":
+				if frame.ContentBlock != nil && frame.ContentBlock.Type == "tool_use" {
+					toolsByIdx[frame.Index] = &antAccTool{
+						id:   frame.ContentBlock.ID,
+						name: frame.ContentBlock.Name,
+					}
+					if frame.Index > maxIdx {
+						maxIdx = frame.Index
+					}
+				}
+			case "content_block_delta":
+				if frame.Delta != nil {
+					if frame.Delta.Type == "text_delta" && frame.Delta.Text != "" {
+						if !yield(gateway.StreamChunk{Text: frame.Delta.Text}, nil) {
+							return
+						}
+					} else if frame.Delta.Type == "input_json_delta" {
+						if t, ok := toolsByIdx[frame.Index]; ok {
+							t.args.WriteString(frame.Delta.PartialJSON)
+						}
+					}
+				}
+			case "message_delta":
+				if frame.Usage != nil {
+					usage.OutputTokens = frame.Usage.OutputTokens
+					hasUsage = true
+				}
+			}
+		}
+
+		var calls []gateway.ToolCall
+		for idx := 0; idx <= maxIdx; idx++ {
+			if t, ok := toolsByIdx[idx]; ok {
+				rawArgs := t.args.String()
+				if rawArgs == "" {
+					rawArgs = "{}"
+				}
+				calls = append(calls, gateway.ToolCall{
+					ID:        t.id,
+					Name:      t.name,
+					Arguments: json.RawMessage(rawArgs),
+				})
+			}
+		}
+		var uPtr *gateway.Usage
+		if hasUsage {
+			uCopy := usage
+			uPtr = &uCopy
+		}
+		yield(gateway.StreamChunk{
+			ToolCalls: calls,
+			Usage:     uPtr,
+			Done:      true,
+		}, nil)
+	}
 }
 
 func (p *Provider) BatchComplete(ctx context.Context, reqs []gateway.Request) ([]gateway.Response, []error) {

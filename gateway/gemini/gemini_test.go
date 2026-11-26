@@ -323,3 +323,48 @@ func TestGeminiContextCachingAndNativeBatch(t *testing.T) {
 		}
 	})
 }
+
+func TestGeminiSSEStreamAndMsgTool(t *testing.T) {
+	var seenFuncResp bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if contents, _ := body["contents"].([]any); len(contents) > 0 {
+			raw, _ := json.Marshal(contents)
+			if bytes.Contains(raw, []byte("functionResponse")) {
+				seenFuncResp = true
+			}
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(
+			"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Part1 \"}]}}]}\n\n" +
+				"data: {\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"text\":\"Part2\"}]}}],\"usageMetadata\":{\"promptTokenCount\":6,\"candidatesTokenCount\":2}}\n\n",
+		))
+	}))
+	defer srv.Close()
+
+	p, err := gemini.New(gemini.Config{APIKey: "k", BaseURL: srv.URL})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	var text string
+	var finalUsage *gateway.Usage
+	for ch, serr := range p.Stream(context.Background(), gateway.Request{
+		Messages: []gateway.Message{
+			{Role: gateway.MsgUser, Content: "calc"},
+			{Role: gateway.MsgAssistant, ToolCalls: []gateway.ToolCall{{ID: "1", Name: "add", Arguments: json.RawMessage(`{"a":1}`)}}},
+			{Role: gateway.MsgTool, Name: "add", ToolCallID: "1", Content: `{"sum":2}`},
+		},
+	}) {
+		if serr != nil {
+			t.Fatalf("Stream: %v", serr)
+		}
+		text += ch.Text
+		if ch.Usage != nil {
+			finalUsage = ch.Usage
+		}
+	}
+	if !seenFuncResp || text != "Part1 Part2" || finalUsage == nil || finalUsage.InputTokens != 6 {
+		t.Fatalf("unexpected gemini stream: funcResp=%v text=%q usage=%+v", seenFuncResp, text, finalUsage)
+	}
+}

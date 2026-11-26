@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 )
@@ -143,9 +144,16 @@ func (c *ClassifierRouter) Route(ctx context.Context, req Request, registered ma
 		return fb.Route(ctx, req, registered, defaultProvider)
 	}
 
-	enumVals := make([]any, 0, len(c.Routes))
-	var descLines []string
-	for name, target := range c.Routes {
+	names := make([]string, 0, len(c.Routes))
+	for name := range c.Routes {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+
+	enumVals := make([]any, 0, len(names))
+	descLines := make([]string, 0, len(names))
+	for _, name := range names {
+		target := c.Routes[name]
 		enumVals = append(enumVals, name)
 		if target.Description != "" {
 			descLines = append(descLines, fmt.Sprintf("- %s: %s", name, target.Description))

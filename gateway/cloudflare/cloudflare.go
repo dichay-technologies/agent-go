@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
+	"iter"
 	"net/http"
 	"strconv"
 	"strings"
@@ -175,6 +177,106 @@ func (p *Provider) Complete(ctx context.Context, req gateway.Request) (gateway.R
 	return resp, nil
 }
 
+// Stream implements gateway.StreamProvider over SSE when using the OpenAI-compatible dialect,
+// and gracefully falls back to a single chunk from Complete for non-streaming dialects.
+func (p *Provider) Stream(ctx context.Context, req gateway.Request) iter.Seq2[gateway.StreamChunk, error] {
+	return func(yield func(gateway.StreamChunk, error) bool) {
+		if p.dialect.Name() != "openai" {
+			resp, err := p.Complete(ctx, req)
+			if err != nil {
+				yield(gateway.StreamChunk{}, err)
+				return
+			}
+			u := resp.Usage
+			yield(gateway.StreamChunk{
+				Text:      resp.Text,
+				ToolCalls: resp.ToolCalls,
+				Usage:     &u,
+				Done:      true,
+			}, nil)
+			return
+		}
+
+		model := req.Model
+		if model == "" {
+			model = p.cfg.DefaultModel
+		}
+		suffix, extraHeaders, body, err := p.dialect.BuildRequest(model, req)
+		if err != nil {
+			yield(gateway.StreamChunk{}, err)
+			return
+		}
+		var bodyMap map[string]any
+		if err := json.Unmarshal(body, &bodyMap); err != nil {
+			yield(gateway.StreamChunk{}, err)
+			return
+		}
+		bodyMap["stream"] = true
+		streamBody, _ := json.Marshal(bodyMap)
+
+		endpoint := p.baseURL
+		if suffix != "" {
+			endpoint += "/" + strings.TrimLeft(suffix, "/")
+		}
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(streamBody))
+		if err != nil {
+			yield(gateway.StreamChunk{}, err)
+			return
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Accept", "text/event-stream")
+		if p.cfg.APIToken != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+p.cfg.APIToken)
+		}
+		if p.cfg.AIGatewayToken != "" {
+			httpReq.Header.Set("cf-aig-authorization", "Bearer "+p.cfg.AIGatewayToken)
+		}
+		for k, v := range p.cacheHeaders(req, extraHeaders) {
+			httpReq.Header.Set(k, v)
+		}
+
+		httpResp, err := p.httpClient.Do(httpReq)
+		if err != nil {
+			yield(gateway.StreamChunk{}, err)
+			return
+		}
+		defer httpResp.Body.Close()
+
+		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+			errBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+			yield(gateway.StreamChunk{}, gateway.ClassifyStatusCode(p.name, httpResp.StatusCode, strings.TrimSpace(string(errBody))))
+			return
+		}
+
+		for ev, sseErr := range gateway.ReadSSE(httpResp.Body) {
+			if sseErr != nil {
+				yield(gateway.StreamChunk{}, sseErr)
+				return
+			}
+			data := strings.TrimSpace(ev.Data)
+			if data == "" || data == "[DONE]" {
+				if data == "[DONE]" {
+					break
+				}
+				continue
+			}
+			var frame struct {
+				Choices []struct {
+					Delta struct {
+						Content string `json:"content"`
+					} `json:"delta"`
+				} `json:"choices"`
+			}
+			if json.Unmarshal([]byte(data), &frame) == nil && len(frame.Choices) > 0 && frame.Choices[0].Delta.Content != "" {
+				if !yield(gateway.StreamChunk{Text: frame.Choices[0].Delta.Content}, nil) {
+					return
+				}
+			}
+		}
+		yield(gateway.StreamChunk{Done: true}, nil)
+	}
+}
+
 // BatchComplete executes a batch of requests. If EnableAsyncBatch is true and the
 // Dialect implements BatchDialect, it submits a native async batch and polls until done.
 // Otherwise, it fans out concurrently over the HTTP connection pool.
@@ -296,7 +398,7 @@ func (p *Provider) doHTTP(ctx context.Context, method, suffix string, extraHeade
 		return nil, fmt.Errorf("cloudflare (%s): read response: %w", p.dialect.Name(), err)
 	}
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		return nil, fmt.Errorf("cloudflare (%s): HTTP %d: %s", p.dialect.Name(), httpResp.StatusCode, strings.TrimSpace(string(respBody)))
+		return nil, gateway.ClassifyStatusCode(p.name, httpResp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 	return respBody, nil
 }

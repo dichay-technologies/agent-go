@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"math/rand/v2"
 	"mime/multipart"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +38,11 @@ type APIError struct {
 
 func (e *APIError) Error() string {
 	return fmt.Sprintf("openai: HTTP %d: %s", e.Status, e.Body)
+}
+
+// Unwrap exposes typed gateway.ProviderError categories (ErrRateLimit, ErrRetryable, ErrAuth, ErrContextLength).
+func (e *APIError) Unwrap() error {
+	return gateway.ClassifyStatusCode("openai", e.Status, e.Body)
 }
 
 // Retryable reports whether the status code (429 or 5xx) should be retried.
@@ -80,6 +87,12 @@ type Provider struct {
 
 // New creates a standalone OpenAI-compatible Provider.
 func New(cfg Config) (*Provider, error) {
+	if cfg.APIKey == "" {
+		cfg.APIKey = os.Getenv("OPENAI_API_KEY")
+	}
+	if cfg.BaseURL == "" {
+		cfg.BaseURL = os.Getenv("OPENAI_BASE_URL")
+	}
 	if cfg.BaseURL == "" {
 		cfg.BaseURL = DefaultBaseURL
 	}
@@ -92,7 +105,11 @@ func New(cfg Config) (*Provider, error) {
 		cfg.Name = "openai"
 	}
 	if cfg.DefaultModel == "" {
-		cfg.DefaultModel = DefaultModel
+		if m := os.Getenv("OPENAI_MODEL"); m != "" {
+			cfg.DefaultModel = m
+		} else {
+			cfg.DefaultModel = DefaultModel
+		}
 	}
 	if cfg.MaxRetries == 0 {
 		cfg.MaxRetries = defaultMaxRetries
@@ -134,6 +151,152 @@ func (p *Provider) Complete(ctx context.Context, req gateway.Request) (gateway.R
 		return gateway.Response{}, err
 	}
 	return parseChatResponse(model, raw)
+}
+
+// Stream implements gateway.StreamProvider over Server-Sent Events (/chat/completions with stream=true).
+func (p *Provider) Stream(ctx context.Context, req gateway.Request) iter.Seq2[gateway.StreamChunk, error] {
+	return func(yield func(gateway.StreamChunk, error) bool) {
+		model := req.Model
+		if model == "" {
+			model = p.cfg.DefaultModel
+		}
+		payload := buildChatRequest(model, req)
+		payload.Stream = true
+		payload.StreamOptions = &oaiStreamOptions{IncludeUsage: true}
+
+		body, err := json.Marshal(payload)
+		if err != nil {
+			yield(gateway.StreamChunk{}, fmt.Errorf("openai: marshal stream request: %w", err))
+			return
+		}
+
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(body))
+		if err != nil {
+			yield(gateway.StreamChunk{}, fmt.Errorf("openai: create stream request: %w", err))
+			return
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Accept", "text/event-stream")
+		if p.cfg.APIKey != "" {
+			httpReq.Header.Set("Authorization", "Bearer "+p.cfg.APIKey)
+		}
+		for k, v := range p.cfg.Headers {
+			httpReq.Header.Set(k, v)
+		}
+
+		httpResp, err := p.httpClient.Do(httpReq)
+		if err != nil {
+			yield(gateway.StreamChunk{}, fmt.Errorf("openai: stream request failed: %w", err))
+			return
+		}
+		defer httpResp.Body.Close()
+
+		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+			errBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+			yield(gateway.StreamChunk{}, &APIError{Status: httpResp.StatusCode, Body: strings.TrimSpace(string(errBody))})
+			return
+		}
+
+		type accTool struct {
+			id   string
+			name string
+			args strings.Builder
+		}
+		toolAcc := make(map[int]*accTool)
+		var maxToolIdx = -1
+		var finalUsage *gateway.Usage
+
+		for ev, sseErr := range gateway.ReadSSE(httpResp.Body) {
+			if sseErr != nil {
+				yield(gateway.StreamChunk{}, sseErr)
+				return
+			}
+			data := strings.TrimSpace(ev.Data)
+			if data == "" {
+				continue
+			}
+			if data == "[DONE]" {
+				break
+			}
+			var frame struct {
+				Choices []struct {
+					Delta struct {
+						Content   string `json:"content"`
+						ToolCalls []struct {
+							Index    int    `json:"index"`
+							ID       string `json:"id"`
+							Function struct {
+								Name      string `json:"name"`
+								Arguments string `json:"arguments"`
+							} `json:"function"`
+						} `json:"tool_calls"`
+					} `json:"delta"`
+				} `json:"choices"`
+				Usage *struct {
+					PromptTokens        int64 `json:"prompt_tokens"`
+					CompletionTokens    int64 `json:"completion_tokens"`
+					PromptTokensDetails struct {
+						CachedTokens int64 `json:"cached_tokens"`
+					} `json:"prompt_tokens_details"`
+				} `json:"usage"`
+			}
+			if err := json.Unmarshal([]byte(data), &frame); err != nil {
+				continue
+			}
+			if frame.Usage != nil {
+				finalUsage = &gateway.Usage{
+					InputTokens:  frame.Usage.PromptTokens,
+					OutputTokens: frame.Usage.CompletionTokens,
+					CachedTokens: frame.Usage.PromptTokensDetails.CachedTokens,
+				}
+			}
+			if len(frame.Choices) > 0 {
+				d := frame.Choices[0].Delta
+				for _, tc := range d.ToolCalls {
+					entry, ok := toolAcc[tc.Index]
+					if !ok {
+						entry = &accTool{}
+						toolAcc[tc.Index] = entry
+						if tc.Index > maxToolIdx {
+							maxToolIdx = tc.Index
+						}
+					}
+					if tc.ID != "" {
+						entry.id = tc.ID
+					}
+					if tc.Function.Name != "" {
+						entry.name = tc.Function.Name
+					}
+					entry.args.WriteString(tc.Function.Arguments)
+				}
+				if d.Content != "" {
+					if !yield(gateway.StreamChunk{Text: d.Content}, nil) {
+						return
+					}
+				}
+			}
+		}
+
+		var calls []gateway.ToolCall
+		for idx := 0; idx <= maxToolIdx; idx++ {
+			if entry, ok := toolAcc[idx]; ok {
+				rawArgs := entry.args.String()
+				if rawArgs == "" {
+					rawArgs = "{}"
+				}
+				calls = append(calls, gateway.ToolCall{
+					ID:        entry.id,
+					Name:      entry.name,
+					Arguments: json.RawMessage(rawArgs),
+				})
+			}
+		}
+		yield(gateway.StreamChunk{
+			ToolCalls: calls,
+			Usage:     finalUsage,
+			Done:      true,
+		}, nil)
+	}
 }
 
 func (p *Provider) BatchComplete(ctx context.Context, reqs []gateway.Request) ([]gateway.Response, []error) {
@@ -485,12 +648,13 @@ func buildChatRequest(model string, req gateway.Request) chatRequest {
 		}
 	}
 	if req.ResponseSchema != nil {
+		normSchema, strictOK := req.ResponseSchema.OpenAINormalize()
 		payload.ResponseFormat = &oaiResponseFormat{
 			Type: "json_schema",
 			JSONSchema: &oaiJSONSchemaSpec{
 				Name:   "response",
-				Strict: true,
-				Schema: req.ResponseSchema,
+				Strict: strictOK,
+				Schema: normSchema,
 			},
 		}
 	}
@@ -593,6 +757,12 @@ type chatRequest struct {
 	Audio          *oaiAudioConfig    `json:"audio,omitempty"`
 	Temperature    *float64           `json:"temperature,omitempty"`
 	MaxTokens      int                `json:"max_tokens,omitempty"`
+	Stream         bool               `json:"stream,omitempty"`
+	StreamOptions  *oaiStreamOptions  `json:"stream_options,omitempty"`
+}
+
+type oaiStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type oaiAudioConfig struct {

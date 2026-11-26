@@ -84,3 +84,38 @@ func TestAnthropicCompleteAndNativeBatch(t *testing.T) {
 	}
 }
 
+func TestAnthropicSSEStream(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(
+			"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":11,\"cache_read_input_tokens\":5}}}\n\n" +
+				"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Claude \"}}\n\n" +
+				"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"lookup\"}}\n\n" +
+				"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"go\\\"}\"}}\n\n" +
+				"event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":4}}\n\n",
+		))
+	}))
+	defer srv.Close()
+
+	p, err := anthropic.New(anthropic.Config{APIKey: "ant-secret", BaseURL: srv.URL})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	var text string
+	var calls []gateway.ToolCall
+	var usage *gateway.Usage
+	for ch, serr := range p.Stream(context.Background(), gateway.Request{Messages: []gateway.Message{{Role: gateway.MsgUser, Content: "hi"}}}) {
+		if serr != nil {
+			t.Fatalf("Stream: %v", serr)
+		}
+		text += ch.Text
+		calls = append(calls, ch.ToolCalls...)
+		if ch.Usage != nil {
+			usage = ch.Usage
+		}
+	}
+	if text != "Claude " || len(calls) != 1 || calls[0].Name != "lookup" || usage == nil || usage.InputTokens != 11 || usage.OutputTokens != 4 {
+		t.Fatalf("unexpected anthropic stream: text=%q calls=%+v usage=%+v", text, calls, usage)
+	}
+}
+

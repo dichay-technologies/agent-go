@@ -311,3 +311,255 @@ func TestGatewayClassifierRouter(t *testing.T) {
 		t.Fatalf("expected explicit model bypass, got: %+v, err=%v", r2, err)
 	}
 }
+
+func TestJSONSchemaEnumObjectNoPanic(t *testing.T) {
+	schema := &gateway.JSONSchema{
+		Type: "object",
+		Enum: []any{
+			map[string]any{"k": "v"},
+			[]any{"a", "b"},
+		},
+	}
+	if err := schema.Validate(json.RawMessage(`{"k":"v"}`)); err != nil {
+		t.Fatalf("expected valid object enum match, got: %v", err)
+	}
+	if err := schema.Validate(json.RawMessage(`{"k":"other"}`)); err == nil {
+		t.Fatalf("expected enum mismatch error")
+	}
+}
+
+func TestGatewaySingleflightLeaderCancel(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	var provCanceled atomic.Bool
+
+	gw := gateway.New(gateway.Config{})
+	gw.Register("mock", mock.New("mock", func(ctx context.Context, req gateway.Request) (gateway.Response, error) {
+		calls.Add(1)
+		close(started)
+		select {
+		case <-release:
+			return gateway.Response{Text: "ok", Usage: gateway.Usage{InputTokens: 10}}, nil
+		case <-ctx.Done():
+			provCanceled.Store(true)
+			return gateway.Response{}, ctx.Err()
+		}
+	}))
+
+	req := gateway.Request{
+		Model:    "m1",
+		Messages: []gateway.Message{{Role: gateway.MsgUser, Content: "hello"}},
+	}
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderErrCh := make(chan error, 1)
+	go func() {
+		_, err := gw.Complete(leaderCtx, req)
+		leaderErrCh <- err
+	}()
+
+	<-started
+
+	followerCh := make(chan gateway.Response, 1)
+	followerErrCh := make(chan error, 1)
+	go func() {
+		r, err := gw.Complete(context.Background(), req)
+		followerCh <- r
+		followerErrCh <- err
+	}()
+
+	// Give follower time to join singleflight.
+	time.Sleep(20 * time.Millisecond)
+	cancelLeader()
+
+	if err := <-leaderErrCh; err != context.Canceled {
+		t.Fatalf("expected leader context.Canceled, got: %v", err)
+	}
+	close(release)
+
+	if err := <-followerErrCh; err != nil {
+		t.Fatalf("follower should succeed when leader cancels, got: %v", err)
+	}
+	if resp := <-followerCh; resp.Text != "ok" {
+		t.Fatalf("unexpected follower response: %+v", resp)
+	}
+	if provCanceled.Load() {
+		t.Fatalf("provider context should not be canceled while follower is waiting")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("expected 1 provider call, got %d", calls.Load())
+	}
+}
+
+func TestGatewayCacheBoundedEviction(t *testing.T) {
+	var calls atomic.Int32
+	gw := gateway.New(gateway.Config{
+		EnableCache:     true,
+		MaxCacheEntries: 2,
+	})
+	gw.Register("mock", mock.New("mock", func(_ context.Context, req gateway.Request) (gateway.Response, error) {
+		calls.Add(1)
+		return gateway.Response{Text: req.Messages[0].Content}, nil
+	}))
+
+	call := func(msg string) gateway.Response {
+		r, err := gw.Complete(context.Background(), gateway.Request{
+			Model:    "m1",
+			Messages: []gateway.Message{{Role: gateway.MsgUser, Content: msg}},
+		})
+		if err != nil {
+			t.Fatalf("Complete(%q): %v", msg, err)
+		}
+		return r
+	}
+
+	call("k1")
+	call("k2")
+	call("k3") // evicts k1
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("expected 3 provider calls, got %d", got)
+	}
+	if r := call("k2"); !r.Cached {
+		t.Fatalf("expected k2 to remain cached")
+	}
+	if r := call("k1"); r.Cached {
+		t.Fatalf("expected k1 to be evicted")
+	}
+}
+
+func TestClassifierRouterDeterministicOrder(t *testing.T) {
+	var seenPrompts []string
+	var mu sync.Mutex
+	jevClassifier := mock.New("jev", func(_ context.Context, req gateway.Request) (gateway.Response, error) {
+		mu.Lock()
+		seenPrompts = append(seenPrompts, req.Messages[0].Content)
+		mu.Unlock()
+		return gateway.Response{Text: `{"route":"alpha"}`}, nil
+	})
+
+	router := &gateway.ClassifierRouter{
+		Classifier: jevClassifier,
+		Routes: map[string]gateway.RouteTarget{
+			"zeta":  {Provider: "p", Model: "m-z", Description: "z"},
+			"alpha": {Provider: "p", Model: "m-a", Description: "a"},
+			"mid":   {Provider: "p", Model: "m-m", Description: "m"},
+		},
+	}
+	gw := gateway.New(gateway.Config{Router: router})
+	gw.Register("p", mock.New("p", func(_ context.Context, req gateway.Request) (gateway.Response, error) {
+		return gateway.Response{Text: req.Model}, nil
+	}))
+
+	for i := 0; i < 10; i++ {
+		if _, err := gw.Complete(context.Background(), gateway.Request{
+			Model:    "auto",
+			Messages: []gateway.Message{{Role: gateway.MsgUser, Content: "hi"}},
+		}); err != nil {
+			t.Fatalf("Complete failed: %v", err)
+		}
+	}
+
+	for i := 1; i < len(seenPrompts); i++ {
+		if seenPrompts[i] != seenPrompts[0] {
+			t.Fatalf("non-deterministic classifier prompt:\n%s\nvs\n%s", seenPrompts[0], seenPrompts[i])
+		}
+	}
+}
+
+func TestSchemaForStruct(t *testing.T) {
+	type item struct {
+		Name  string   `json:"name" desc:"item name"`
+		Count int      `json:"count"`
+		Note  string   `json:"note,omitempty"`
+		Tags  []string `json:"tags"`
+	}
+	s := gateway.SchemaFor[item]()
+	if s.Type != "object" || s.Properties["name"].Description != "item name" || s.Properties["count"].Type != "integer" {
+		t.Fatalf("unexpected generated schema: %+v", s)
+	}
+	if err := s.Validate(json.RawMessage(`{"name":"a","count":1,"tags":["x"]}`)); err != nil {
+		t.Fatalf("expected valid payload, got: %v", err)
+	}
+	if err := s.Validate(json.RawMessage(`{"name":"a"}`)); err == nil {
+		t.Fatalf("expected missing required field error")
+	}
+}
+
+func TestGatewayUsageSinkMetaAndStream(t *testing.T) {
+	var sinkCalls atomic.Int32
+	var lastMeta string
+	gw := gateway.New(gateway.Config{
+		UsageSink: gateway.UsageSinkFunc(func(_ context.Context, req gateway.Request, u gateway.Usage) {
+			sinkCalls.Add(1)
+			lastMeta = req.Meta["tenant"]
+		}),
+		UsageKey: func(req gateway.Request) string {
+			return req.Meta["tenant"]
+		},
+	})
+	gw.Register("mock", mock.New("mock", func(_ context.Context, _ gateway.Request) (gateway.Response, error) {
+		return gateway.Response{
+			Text:  "streamed",
+			Usage: gateway.Usage{InputTokens: 3, OutputTokens: 7},
+		}, nil
+	}))
+
+	var gotText string
+	for ch, err := range gw.Stream(context.Background(), gateway.Request{
+		Model: "m1",
+		Meta:  map[string]string{"tenant": "acme"},
+	}) {
+		if err != nil {
+			t.Fatalf("Stream failed: %v", err)
+		}
+		gotText += ch.Text
+	}
+	if gotText != "streamed" || sinkCalls.Load() != 1 || lastMeta != "acme" {
+		t.Fatalf("unexpected stream/usage: text=%q calls=%d meta=%q", gotText, sinkCalls.Load(), lastMeta)
+	}
+	if u := gw.UsageByProject("acme"); u.InputTokens != 3 || u.OutputTokens != 7 {
+		t.Fatalf("unexpected UsageByProject for custom key: %+v", u)
+	}
+}
+
+func TestGatewayTypedErrors(t *testing.T) {
+	err429 := gateway.ClassifyStatusCode("openai", 429, "rate limit")
+	if !isErr(err429, gateway.ErrRateLimit) || !isErr(err429, gateway.ErrRetryable) {
+		t.Fatalf("expected ErrRateLimit and ErrRetryable, got %v", err429)
+	}
+	err401 := gateway.ClassifyStatusCode("openai", 401, "bad key")
+	if !isErr(err401, gateway.ErrAuth) {
+		t.Fatalf("expected ErrAuth, got %v", err401)
+	}
+	errCtx := gateway.ClassifyStatusCode("openai", 400, "maximum context length exceeded")
+	if !isErr(errCtx, gateway.ErrContextLength) {
+		t.Fatalf("expected ErrContextLength, got %v", errCtx)
+	}
+
+	fc, err := gateway.NewFileCache(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFileCache: %v", err)
+	}
+	fc.Set(context.Background(), "k1", gateway.Response{Text: "persisted", Usage: gateway.Usage{InputTokens: 9}}, time.Minute)
+	got, ok := fc.Get(context.Background(), "k1")
+	if !ok || got.Text != "persisted" || got.Usage.InputTokens != 9 {
+		t.Fatalf("unexpected FileCache Get: ok=%v resp=%+v", ok, got)
+	}
+}
+
+func isErr(err, target error) bool {
+	return err != nil && (err == target || strings.Contains(err.Error(), target.Error()) || unwrapContains(err, target))
+}
+
+func unwrapContains(err, target error) bool {
+	type multiUnwrap interface{ Unwrap() []error }
+	if mu, ok := err.(multiUnwrap); ok {
+		for _, e := range mu.Unwrap() {
+			if e == target {
+				return true
+			}
+		}
+	}
+	return false
+}

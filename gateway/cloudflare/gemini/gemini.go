@@ -15,12 +15,30 @@ type Dialect struct{}
 func (d Dialect) Name() string { return "gemini" }
 
 func (d Dialect) BuildRequest(model string, req gateway.Request) (string, map[string]string, []byte, error) {
+	type gemFuncCall struct {
+		Name string          `json:"name"`
+		Args json.RawMessage `json:"args,omitempty"`
+	}
+	type gemFuncResp struct {
+		Name     string          `json:"name"`
+		Response json.RawMessage `json:"response"`
+	}
 	type gemPart struct {
-		Text string `json:"text,omitempty"`
+		Text             string       `json:"text,omitempty"`
+		FunctionCall     *gemFuncCall `json:"functionCall,omitempty"`
+		FunctionResponse *gemFuncResp `json:"functionResponse,omitempty"`
 	}
 	type gemContent struct {
 		Role  string    `json:"role,omitempty"`
 		Parts []gemPart `json:"parts"`
+	}
+	type gemFuncDecl struct {
+		Name        string              `json:"name"`
+		Description string              `json:"description,omitempty"`
+		Parameters  *gateway.JSONSchema `json:"parameters,omitempty"`
+	}
+	type gemTool struct {
+		FunctionDeclarations []gemFuncDecl `json:"functionDeclarations"`
 	}
 	type gemGenConfig struct {
 		Temperature      *float64            `json:"temperature,omitempty"`
@@ -43,14 +61,54 @@ func (d Dialect) BuildRequest(model string, req gateway.Request) (string, map[st
 			sysInst.Parts = append(sysInst.Parts, gemPart{Text: m.Content})
 			continue
 		}
+		if m.Role == gateway.MsgTool {
+			fnName := m.Name
+			if fnName == "" {
+				fnName = m.ToolCallID
+			}
+			respObj := map[string]any{"result": m.Content}
+			var decoded map[string]any
+			if json.Unmarshal([]byte(m.Content), &decoded) == nil && decoded != nil {
+				respObj = decoded
+			}
+			respBytes, _ := json.Marshal(respObj)
+			contents = append(contents, gemContent{
+				Role: "user",
+				Parts: []gemPart{{
+					FunctionResponse: &gemFuncResp{Name: fnName, Response: respBytes},
+				}},
+			})
+			continue
+		}
 		role := "user"
 		if m.Role == gateway.MsgAssistant {
 			role = "model"
 		}
-		contents = append(contents, gemContent{
-			Role:  role,
-			Parts: []gemPart{{Text: m.Content}},
-		})
+		var parts []gemPart
+		if m.Content != "" {
+			parts = append(parts, gemPart{Text: m.Content})
+		}
+		for _, tc := range m.ToolCalls {
+			parts = append(parts, gemPart{
+				FunctionCall: &gemFuncCall{Name: tc.Name, Args: tc.Arguments},
+			})
+		}
+		if len(parts) > 0 {
+			contents = append(contents, gemContent{Role: role, Parts: parts})
+		}
+	}
+
+	var tools []gemTool
+	if len(req.Tools) > 0 {
+		decls := make([]gemFuncDecl, len(req.Tools))
+		for i, t := range req.Tools {
+			decls[i] = gemFuncDecl{
+				Name:        t.Name,
+				Description: t.Description,
+				Parameters:  t.Parameters,
+			}
+		}
+		tools = []gemTool{{FunctionDeclarations: decls}}
 	}
 
 	var genCfg *gemGenConfig
@@ -68,10 +126,12 @@ func (d Dialect) BuildRequest(model string, req gateway.Request) (string, map[st
 	payload := struct {
 		SystemInstruction *gemContent   `json:"systemInstruction,omitempty"`
 		Contents          []gemContent  `json:"contents"`
+		Tools             []gemTool     `json:"tools,omitempty"`
 		GenerationConfig  *gemGenConfig `json:"generationConfig,omitempty"`
 	}{
 		SystemInstruction: sysInst,
 		Contents:          contents,
+		Tools:             tools,
 		GenerationConfig:  genCfg,
 	}
 
@@ -141,4 +201,3 @@ func (d Dialect) ParseResponse(model string, raw []byte) (gateway.Response, erro
 		},
 	}, nil
 }
-

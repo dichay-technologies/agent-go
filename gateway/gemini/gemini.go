@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"iter"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -73,13 +75,20 @@ type Provider struct {
 // New creates a standalone Gemini Provider.
 func New(cfg Config) (*Provider, error) {
 	if cfg.APIKey == "" {
+		cfg.APIKey = os.Getenv("GEMINI_API_KEY")
+	}
+	if cfg.APIKey == "" {
 		return nil, fmt.Errorf("gemini: APIKey is required")
 	}
 	if cfg.Name == "" {
 		cfg.Name = "gemini"
 	}
 	if cfg.DefaultModel == "" {
-		cfg.DefaultModel = DefaultModel
+		if m := os.Getenv("GEMINI_MODEL"); m != "" {
+			cfg.DefaultModel = m
+		} else {
+			cfg.DefaultModel = DefaultModel
+		}
 	}
 	if cfg.MaxBatchConcurrency <= 0 {
 		cfg.MaxBatchConcurrency = defaultConcurrency
@@ -136,6 +145,88 @@ func (p *Provider) Complete(ctx context.Context, req gateway.Request) (gateway.R
 		return gateway.Response{}, err
 	}
 	return parseResponse(model, respBody)
+}
+
+// Stream implements gateway.StreamProvider using Gemini's streamGenerateContent?alt=sse endpoint.
+func (p *Provider) Stream(ctx context.Context, req gateway.Request) iter.Seq2[gateway.StreamChunk, error] {
+	return func(yield func(gateway.StreamChunk, error) bool) {
+		model := req.Model
+		if model == "" {
+			model = p.cfg.DefaultModel
+		}
+		payload := buildRequest(req)
+		if p.cfg.EnableContextCache && !req.BypassCache && req.SystemPrefix != "" {
+			if cacheName, err := p.ensureContextCache(ctx, model, payload.SystemInstruction, payload.Tools); err == nil && cacheName != "" {
+				payload.CachedContent = cacheName
+				payload.SystemInstruction = nil
+				payload.Tools = nil
+			}
+		}
+		body, err := json.Marshal(payload)
+		if err != nil {
+			yield(gateway.StreamChunk{}, fmt.Errorf("gemini: marshal stream request: %w", err))
+			return
+		}
+
+		endpoint := fmt.Sprintf("%s/v1beta/models/%s:streamGenerateContent?alt=sse", p.baseURL, strings.TrimLeft(model, "/"))
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if err != nil {
+			yield(gateway.StreamChunk{}, fmt.Errorf("gemini: create stream request: %w", err))
+			return
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Accept", "text/event-stream")
+		httpReq.Header.Set("x-goog-api-key", p.cfg.APIKey)
+
+		httpResp, err := p.httpClient.Do(httpReq)
+		if err != nil {
+			yield(gateway.StreamChunk{}, fmt.Errorf("gemini: stream request failed: %w", err))
+			return
+		}
+		defer httpResp.Body.Close()
+
+		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+			errBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+			yield(gateway.StreamChunk{}, gateway.ClassifyStatusCode(p.name, httpResp.StatusCode, strings.TrimSpace(string(errBody))))
+			return
+		}
+
+		var calls []gateway.ToolCall
+		var lastUsage *gateway.Usage
+
+		for ev, sseErr := range gateway.ReadSSE(httpResp.Body) {
+			if sseErr != nil {
+				yield(gateway.StreamChunk{}, sseErr)
+				return
+			}
+			data := strings.TrimSpace(ev.Data)
+			if data == "" {
+				continue
+			}
+			parsed, perr := parseResponse(model, []byte(data))
+			if perr != nil {
+				continue
+			}
+			if parsed.Usage.InputTokens > 0 || parsed.Usage.OutputTokens > 0 || parsed.Usage.CachedTokens > 0 {
+				u := parsed.Usage
+				lastUsage = &u
+			}
+			if len(parsed.ToolCalls) > 0 {
+				calls = append(calls, parsed.ToolCalls...)
+			}
+			if parsed.Text != "" {
+				if !yield(gateway.StreamChunk{Text: parsed.Text}, nil) {
+					return
+				}
+			}
+		}
+
+		yield(gateway.StreamChunk{
+			ToolCalls: calls,
+			Usage:     lastUsage,
+			Done:      true,
+		}, nil)
+	}
 }
 
 // CreateContextCache explicitly creates a Gemini cachedContents resource and returns its name.
@@ -413,7 +504,7 @@ func (p *Provider) doHTTP(ctx context.Context, method, endpoint string, body []b
 		return nil, fmt.Errorf("gemini: read response: %w", err)
 	}
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		return nil, fmt.Errorf("gemini: HTTP %d: %s", httpResp.StatusCode, strings.TrimSpace(string(respBody)))
+		return nil, gateway.ClassifyStatusCode(p.name, httpResp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 	return respBody, nil
 }
@@ -440,6 +531,28 @@ func buildRequest(req gateway.Request) gemRequest {
 				sysInst = &gemContent{}
 			}
 			sysInst.Parts = append(sysInst.Parts, gemPart{Text: m.Content})
+			continue
+		}
+		if m.Role == gateway.MsgTool {
+			fnName := m.Name
+			if fnName == "" {
+				fnName = m.ToolCallID
+			}
+			respObj := map[string]any{"result": m.Content}
+			var decoded map[string]any
+			if json.Unmarshal([]byte(m.Content), &decoded) == nil && decoded != nil {
+				respObj = decoded
+			}
+			respBytes, _ := json.Marshal(respObj)
+			contents = append(contents, gemContent{
+				Role: "user",
+				Parts: []gemPart{{
+					FunctionResponse: &gemFunctionResponse{
+						Name:     fnName,
+						Response: respBytes,
+					},
+				}},
+			})
 			continue
 		}
 		role := "user"
@@ -615,10 +728,16 @@ type gemContent struct {
 }
 
 type gemPart struct {
-	Text         string           `json:"text,omitempty"`
-	InlineData   *gemBlob         `json:"inlineData,omitempty"`
-	FileData     *gemFileData     `json:"fileData,omitempty"`
-	FunctionCall *gemFunctionCall `json:"functionCall,omitempty"`
+	Text             string               `json:"text,omitempty"`
+	InlineData       *gemBlob             `json:"inlineData,omitempty"`
+	FileData         *gemFileData         `json:"fileData,omitempty"`
+	FunctionCall     *gemFunctionCall     `json:"functionCall,omitempty"`
+	FunctionResponse *gemFunctionResponse `json:"functionResponse,omitempty"`
+}
+
+type gemFunctionResponse struct {
+	Name     string          `json:"name"`
+	Response json.RawMessage `json:"response"`
 }
 
 type gemBlob struct {

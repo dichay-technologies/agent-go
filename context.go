@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"iter"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"text/template"
@@ -35,7 +37,13 @@ func NewFuture(ctx context.Context, name string, child Agent) *Future {
 		done: make(chan struct{}),
 	}
 	go func() {
-		defer close(f.done)
+		defer func() {
+			if r := recover(); r != nil {
+				f.val = nil
+				f.err = fmt.Errorf("agent: panic in child %q: %v", name, r)
+			}
+			close(f.done)
+		}()
 		f.val, f.err = child.Run(ctx)
 	}()
 	return f
@@ -64,10 +72,23 @@ type Context interface {
 	AI() *gateway.AIGateway
 	Agent() Agent
 	Child(name string) (Agent, bool)
+	RunState() RunState
+
+	Bus() *Bus
+	Bank() *MemoryBank
+	Permissions() []string
+	HasPermission(perm string) bool
 
 	Call(req gateway.Request) (gateway.Response, error)
+	Stream(req gateway.Request) iter.Seq2[gateway.StreamChunk, error]
 	Run(child Agent) (any, error)
 	Spawn(child Agent) (*Future, error)
+	SpawnNamed(name string, child Agent) (*Future, error)
+
+	Send(to, content string, data ...map[string]any) (Envelope, error)
+	Inbox() []Envelope
+
+	WithStdContext(parent context.Context) Context
 }
 
 // ContextConfig configures a new Context.
@@ -77,7 +98,12 @@ type ContextConfig struct {
 	Gateway      *gateway.AIGateway
 	Agent        Agent
 	Children     map[string]Agent
+	Bus          *Bus
+	Bank         *MemoryBank
+	Permissions  []string
 	SpawnFn      func(ctx context.Context, child Agent) (*Future, error)
+	SpawnNamedFn func(ctx context.Context, name string, child Agent) (*Future, error)
+	RunStateFn   func() RunState
 }
 
 type agentContext struct {
@@ -99,6 +125,9 @@ func NewContext(parent context.Context, cfg ContextConfig) Context {
 
 // ContextFrom extracts an agentgo.Context from a plain context.Context if present.
 func ContextFrom(ctx context.Context) (Context, bool) {
+	if ctx == nil {
+		return nil, false
+	}
 	if c, ok := ctx.(Context); ok {
 		return c, true
 	}
@@ -106,8 +135,31 @@ func ContextFrom(ctx context.Context) (Context, bool) {
 	return c, ok && c != nil
 }
 
+func (c *agentContext) WithStdContext(parent context.Context) Context {
+	if parent == nil {
+		parent = context.Background()
+	}
+	return NewContext(parent, c.cfg)
+}
+
 func (c *agentContext) AI() *gateway.AIGateway { return c.cfg.Gateway }
-func (c *agentContext) Agent() Agent          { return c.cfg.Agent }
+func (c *agentContext) Agent() Agent           { return c.cfg.Agent }
+func (c *agentContext) Bus() *Bus              { return c.cfg.Bus }
+func (c *agentContext) Bank() *MemoryBank      { return c.cfg.Bank }
+func (c *agentContext) Permissions() []string  { return append([]string(nil), c.cfg.Permissions...) }
+func (c *agentContext) HasPermission(perm string) bool {
+	if len(c.cfg.Permissions) == 0 {
+		return true
+	}
+	return slices.Contains(c.cfg.Permissions, "*") || slices.Contains(c.cfg.Permissions, perm)
+}
+
+func (c *agentContext) RunState() RunState {
+	if c.cfg.RunStateFn != nil {
+		return c.cfg.RunStateFn()
+	}
+	return RunState{}
+}
 
 func (c *agentContext) Child(name string) (Agent, bool) {
 	if c.cfg.Children == nil {
@@ -130,6 +182,21 @@ func (c *agentContext) Call(req gateway.Request) (gateway.Response, error) {
 	return c.cfg.Gateway.Complete(c, req)
 }
 
+func (c *agentContext) Stream(req gateway.Request) iter.Seq2[gateway.StreamChunk, error] {
+	if c.cfg.Gateway == nil {
+		return func(yield func(gateway.StreamChunk, error) bool) {
+			yield(gateway.StreamChunk{}, fmt.Errorf("agentgo: AIGateway is nil in context"))
+		}
+	}
+	if req.ProjectID == "" {
+		req.ProjectID = c.cfg.ProjectID
+	}
+	if req.Model == "" {
+		req.Model = c.cfg.DefaultModel
+	}
+	return c.cfg.Gateway.Stream(c, req)
+}
+
 func (c *agentContext) Run(child Agent) (any, error) {
 	if child == nil {
 		return nil, fmt.Errorf("agentgo: child agent is nil")
@@ -138,13 +205,53 @@ func (c *agentContext) Run(child Agent) (any, error) {
 }
 
 func (c *agentContext) Spawn(child Agent) (*Future, error) {
+	return c.SpawnNamed("", child)
+}
+
+func (c *agentContext) SpawnNamed(name string, child Agent) (*Future, error) {
 	if child == nil {
 		return nil, fmt.Errorf("agentgo: child agent is nil")
+	}
+	if c.cfg.SpawnNamedFn != nil {
+		return c.cfg.SpawnNamedFn(c, name, child)
 	}
 	if c.cfg.SpawnFn != nil {
 		return c.cfg.SpawnFn(c, child)
 	}
-	return NewFuture(c, "", child), nil
+	return NewFuture(c, name, child), nil
+}
+
+func (c *agentContext) Send(to, content string, data ...map[string]any) (Envelope, error) {
+	if c.cfg.Bus == nil {
+		return Envelope{}, fmt.Errorf("agentgo: Bus is nil in context")
+	}
+	var payload map[string]any
+	if len(data) > 0 {
+		payload = data[0]
+	}
+	from := agentIdentifier(c.cfg.Agent)
+	if to == "parent" && c.cfg.Agent != nil && c.cfg.Agent.Parent() != nil {
+		if pid := agentIdentifier(c.cfg.Agent.Parent()); pid != "" {
+			to = pid
+		}
+	}
+	return c.cfg.Bus.Send(Envelope{
+		From:    from,
+		To:      to,
+		Content: content,
+		Data:    payload,
+	})
+}
+
+func (c *agentContext) Inbox() []Envelope {
+	if c.cfg.Bus == nil {
+		return nil
+	}
+	id := agentIdentifier(c.cfg.Agent)
+	if id == "" {
+		return nil
+	}
+	return c.cfg.Bus.Drain(id)
 }
 
 // ============================================================================
@@ -162,12 +269,18 @@ type staticDataSource struct {
 	content string
 }
 
-func (s staticDataSource) Name() string                  { return s.name }
+func (s staticDataSource) Name() string                      { return s.name }
 func (s staticDataSource) Content(_ Context) (string, error) { return s.content, nil }
 
 // StaticData creates an in-memory DataSource.
 func StaticData(name, content string) DataSource {
 	return staticDataSource{name: name, content: content}
+}
+
+// Untrusted wraps external or user-supplied text in explicit boundary tags
+// so models can distinguish untrusted data from system instructions.
+func Untrusted(text string) string {
+	return "<untrusted_data>\n" + text + "\n</untrusted_data>"
 }
 
 var tmplCache sync.Map // string -> *template.Template

@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -21,8 +22,7 @@ import (
 	"proj.dichay.tech/agent-go/gateway/openai"
 )
 
-type ChatState struct {
-	History     []gateway.Message
+type ChatStats struct {
 	ToolRuns    int
 	SpawnedJobs int
 }
@@ -32,12 +32,27 @@ type luaExecArgs struct {
 }
 
 type spawnWorkerArgs struct {
-	Task string `json:"task"`
+	ID         string   `json:"id,omitempty"`
+	Task       string   `json:"task"`
+	Tools      []string `json:"tools,omitempty"`
+	MemoryKeys []string `json:"memory_keys,omitempty"`
+	Background bool     `json:"background,omitempty"`
 }
 
 func main() {
 	gw, chatModel, decisionModel := setupGateway()
+
+	var stdinMu sync.Mutex
 	scanner := bufio.NewScanner(os.Stdin)
+	readLine := func() (string, bool) {
+		stdinMu.Lock()
+		defer stdinMu.Unlock()
+		if !scanner.Scan() {
+			return "", false
+		}
+		return scanner.Text(), true
+	}
+
 	var traceEnabled atomic.Bool
 	traceEnabled.Store(true)
 
@@ -62,7 +77,7 @@ func main() {
 	// Tool 1: Full-access gopher-lua with interactive user permission prompt.
 	luaExec := agentgo.NewTypedTool(
 		"lua_exec",
-		"Executes Lua 5.1 code with full standard libraries (os, io, math, string, table). Use print(...) for stdout.",
+		"Executes Lua 5.1 code on the host with full filesystem and shell access (os, io, io.open, io.popen, math, string, table). Use print(...) for stdout.",
 		&gateway.JSONSchema{
 			Type:     "object",
 			Required: []string{"code"},
@@ -72,15 +87,19 @@ func main() {
 		},
 		true,
 		func(ctx agentgo.Context, in luaExecArgs) (any, error) {
+			if !ctx.HasPermission("lua.exec") {
+				return nil, fmt.Errorf("permission lua.exec denied")
+			}
 			fmt.Println("\n  ┌─ [PERMISSION] Agent wants to execute Lua code:")
 			for _, line := range strings.Split(strings.TrimRight(in.Code, "\n"), "\n") {
 				fmt.Printf("  │ %s\n", line)
 			}
 			fmt.Print("  └─ Allow execution? [y/N]: ")
-			if !scanner.Scan() {
+			rawAns, ok := readLine()
+			if !ok {
 				return map[string]any{"denied": true, "reason": "stdin closed"}, nil
 			}
-			ans := strings.ToLower(strings.TrimSpace(scanner.Text()))
+			ans := strings.ToLower(strings.TrimSpace(rawAns))
 			if ans != "y" && ans != "yes" && ans != "д" && ans != "да" {
 				fmt.Println("  [lua] Denied by user.")
 				return map[string]any{"denied": true, "reason": "user rejected execution"}, nil
@@ -101,218 +120,260 @@ func main() {
 		},
 	)
 
-	// Tool 2: Spawn a child agent using ctx.Spawn(agentgo.Fork(...)).
+	// Tool 2: Spawn a child agent on the shared Bus, optionally passing selected memory keys.
 	spawnWorker := agentgo.NewTypedTool(
 		"spawn_worker",
-		"Spawns an independent child AI agent to handle a subtask and returns its result.",
+		"Spawns a child AI agent on the shared message bus to handle a subtask. Supports passing memory_keys from your memory bank and running in background.",
 		&gateway.JSONSchema{
 			Type:     "object",
 			Required: []string{"task"},
 			Properties: map[string]*gateway.JSONSchema{
-				"task": {Type: "string", Description: "Subtask description for the child agent"},
+				"id":          {Type: "string", Description: "Optional worker ID on the bus"},
+				"task":        {Type: "string", Description: "Subtask description for the child agent"},
+				"tools":       {Type: "array", Description: "Optional subset of tool names to grant", Items: &gateway.JSONSchema{Type: "string"}},
+				"memory_keys": {Type: "array", Description: "Optional memory keys to copy into the child's memory bank", Items: &gateway.JSONSchema{Type: "string"}},
+				"background":  {Type: "boolean", Description: "If true, runs asynchronously and reports back via agent_send or WaitDeps"},
 			},
 		},
 		true,
 		func(ctx agentgo.Context, in spawnWorkerArgs) (any, error) {
-			parent, _ := ctx.Agent().(*agentgo.AI[ChatState])
-			child := agentgo.Fork[ChatState, ChatState](parent,
-				agentgo.WithID[ChatState](fmt.Sprintf("worker-%d", time.Now().UnixNano()%10000)),
-				agentgo.WithSkipPlanning[ChatState](true),
-				agentgo.WithTask[ChatState](in.Task),
-			)
-			fmt.Printf("  [spawn] launching child %q (depth=%d, parent=%s) for: %s\n",
-				child.ID, child.State.SpawnDepth, parent.ID, in.Task)
+			parent, _ := ctx.Agent().(*agentgo.AI[ChatStats])
+			workerID := in.ID
+			if workerID == "" {
+				workerID = fmt.Sprintf("worker-%d", time.Now().UnixNano()%10000)
+			}
+			opts := []agentgo.Option[ChatStats]{
+				agentgo.WithID[ChatStats](workerID),
+				agentgo.WithSkipPlanning[ChatStats](true),
+				agentgo.WithTask[ChatStats](in.Task),
+			}
+			if len(in.Tools) > 0 && parent != nil {
+				allowed := make(map[string]bool, len(in.Tools))
+				for _, name := range in.Tools {
+					allowed[name] = true
+				}
+				var selected []agentgo.Tool
+				for _, pt := range parent.Tools {
+					if allowed[pt.Name()] {
+						selected = append(selected, pt)
+					}
+				}
+				opts = append(opts, agentgo.WithTools[ChatStats](selected...))
+			}
+			child := agentgo.Fork[ChatStats, ChatStats](parent, opts...)
+			if len(in.MemoryKeys) > 0 && ctx.Bank() != nil {
+				ctx.Bank().CopyTo(child.EnsureBank(), in.MemoryKeys...)
+			}
+			fmt.Printf("  [spawn] launching child %q (depth=%d, bg=%v) for: %s\n",
+				child.ID, child.BaseSpawnDepth, in.Background, in.Task)
 
-			fut, err := ctx.Spawn(child)
+			fut, err := ctx.SpawnNamed(child.ID, child)
 			if err != nil {
 				return nil, err
+			}
+			if parent != nil {
+				parent.Memory.Update(func(s *ChatStats) { s.SpawnedJobs++ })
+			}
+			if in.Background {
+				return map[string]any{"worker": child.ID, "status": "running_in_background"}, nil
 			}
 			out, err := fut.Await(ctx)
 			if err != nil {
 				return nil, err
 			}
-			parent.Memory.Update(func(s *ChatState) { s.SpawnedJobs++ })
 			fmt.Printf("  [spawn] child %q finished.\n", child.ID)
 			return map[string]any{"worker": child.ID, "output": out}, nil
 		},
 	)
 
-	state := agentgo.NewLocalState(ChatState{})
+	stats := agentgo.NewLocalState(ChatStats{})
 
-	chatInvoker := agentgo.ToolInvokerFunc(func(ctx agentgo.Context, req agentgo.ToolCallRequest) (agentgo.ToolCallResult, error) {
-		specs := make([]gateway.ToolSpec, len(req.Tools))
-		toolMap := make(map[string]agentgo.Tool, len(req.Tools))
-		for i, t := range req.Tools {
-			toolMap[t.Name()] = t
-			specs[i] = gateway.ToolSpec{
-				Name:        t.Name(),
-				Description: t.Description(),
-				Parameters:  t.Schema(),
-			}
-		}
-
-		msgs := append([]gateway.Message(nil), req.Messages...)
-		for turn := 0; turn < 5; turn++ {
-			selectModel := req.Model
-			if turn == 0 && decisionModel != "" {
-				selectModel = decisionModel
-			}
+	// Wrap default stages with FSM phase logging.
+	tracedStage := func(name string, fn agentgo.StageFunc[ChatStats]) agentgo.StageFunc[ChatStats] {
+		return func(ctx agentgo.Context, a *agentgo.AI[ChatStats]) error {
 			if traceEnabled.Load() {
-				fmt.Printf("  [step] turn=%d deciding with model=%s (tools=%d)\n", turn+1, selectModel, len(specs))
+				fmt.Printf("  [fsm] -> %s (status=%s)\n", name, ctx.RunState().Status)
 			}
-
-			resp, err := ctx.Call(gateway.Request{
-				Model:        selectModel,
-				SystemPrefix: req.SystemPrefix,
-				Messages:     msgs,
-				Tools:        specs,
-			})
-			if err != nil {
-				return agentgo.ToolCallResult{}, err
-			}
-			if len(resp.ToolCalls) == 0 {
-				if selectModel == decisionModel && chatModel != "" && selectModel != chatModel {
-					if traceEnabled.Load() {
-						fmt.Printf("  [step] no tool needed -> generating reply with %s\n", chatModel)
-					}
-					chatResp, err := ctx.Call(gateway.Request{
-						Model:        chatModel,
-						SystemPrefix: req.SystemPrefix,
-						Messages:     msgs,
-					})
-					if err != nil {
-						return agentgo.ToolCallResult{}, err
-					}
-					return agentgo.ToolCallResult{Selected: false, Text: chatResp.Text}, nil
+			err := fn(ctx, a)
+			if err == nil && name == "Plan" && traceEnabled.Load() {
+				if plan := ctx.RunState().Plan; len(plan) > 0 {
+					b, _ := json.Marshal(plan)
+					fmt.Printf("  [plan] %s\n", string(b))
 				}
-				return agentgo.ToolCallResult{Selected: false, Text: resp.Text}, nil
 			}
-
-			tc := resp.ToolCalls[0]
-			t, ok := toolMap[tc.Name]
-			if !ok {
-				return agentgo.ToolCallResult{}, fmt.Errorf("unknown tool %q", tc.Name)
-			}
-			if traceEnabled.Load() {
-				fmt.Printf("  [tool] selected=%s (needsGen=%v)\n", t.Name(), t.NeedsGeneration())
-			}
-
-			args := tc.Arguments
-			if t.NeedsGeneration() {
-				argModel := req.ArgModel
-				if argModel == "" {
-					argModel = chatModel
-				}
-				genMsgs := append(msgs, gateway.Message{
-					Role:    gateway.MsgUser,
-					Content: fmt.Sprintf("Generate valid JSON arguments for tool %q (%s).", t.Name(), t.Description()),
-				})
-				genResp, err := ctx.Call(gateway.Request{
-					Model:          argModel,
-					SystemPrefix:   req.SystemPrefix,
-					Messages:       genMsgs,
-					ResponseSchema: t.Schema(),
-				})
-				if err != nil {
-					return agentgo.ToolCallResult{}, fmt.Errorf("generate args for %q: %w", t.Name(), err)
-				}
-				args = json.RawMessage(genResp.Text)
-			}
-
-			out, execErr := t.Execute(ctx, args)
-			if execErr != nil {
-				out = map[string]any{"error": execErr.Error()}
-			}
-			state.Update(func(s *ChatState) { s.ToolRuns++ })
-			outJSON, _ := json.Marshal(out)
-
-			tc.Arguments = args
-			msgs = append(msgs,
-				gateway.Message{Role: gateway.MsgAssistant, ToolCalls: []gateway.ToolCall{tc}},
-				gateway.Message{Role: gateway.MsgTool, ToolCallID: tc.ID, Name: tc.Name, Content: string(outJSON)},
-			)
-		}
-		return agentgo.ToolCallResult{}, fmt.Errorf("too many tool turns")
-	})
-
-	ag := agentgo.New[ChatState](
-		agentgo.WithID[ChatState]("luachat-root"),
-		agentgo.WithProject[ChatState]("luachat"),
-		agentgo.WithGateway[ChatState](gw),
-		agentgo.WithModel[ChatState](chatModel),
-		agentgo.WithSystemPrefix[ChatState](
-			"You are a transparent assistant with full Lua execution (lua_exec) and child agent spawning (spawn_worker). Always include exact tool outputs in your final answer.",
-		),
-		agentgo.WithTools[ChatState](luaExec, spawnWorker),
-		agentgo.WithToolInvoker[ChatState](chatInvoker),
-		agentgo.WithSkipPlanning[ChatState](true),
-	)
-	ag.Memory = state
-	ag.ArgModel = chatModel
-	ag.Pipeline.Execute = func(ctx agentgo.Context, a *agentgo.AI[ChatState]) error {
-		res, err := chatInvoker.Invoke(ctx, agentgo.ToolCallRequest{
-			ProjectID:    a.ProjectID,
-			Model:        a.Model,
-			ArgModel:     a.ArgModel,
-			SystemPrefix: a.SystemPrefix,
-			Messages:     a.Memory.Get().History,
-			Tools:        a.Tools,
-		})
-		if err != nil {
 			return err
 		}
-		a.State.Output = res.Text
-		return nil
 	}
 
-	fmt.Printf("Microchat ready (chat: %s, decision: %s).\n", chatModel, decisionModel)
-	fmt.Println("Commands: /state, /memory, /usage, /trace, /exit")
+	// Adaptive Plan stage: decisionModel (Jev) decides whether multi-step planning is needed.
+	adaptivePlan := func(ctx agentgo.Context, a *agentgo.AI[ChatStats]) error {
+		taskText := ctx.RunState().Task
+		if decisionModel != "" && taskText != "" {
+			resp, err := ctx.Call(gateway.Request{
+				Model: decisionModel,
+				Messages: []gateway.Message{{
+					Role:    gateway.MsgUser,
+					Content: fmt.Sprintf("Does this task require a multi-step execution plan, or can it be answered/executed directly in one step?\nTask: %s", taskText),
+				}},
+				ResponseSchema: &gateway.JSONSchema{
+					Type:     "object",
+					Required: []string{"needs_plan"},
+					Properties: map[string]*gateway.JSONSchema{
+						"needs_plan": {Type: "string", Enum: []any{"yes", "no"}},
+					},
+				},
+			})
+			if err == nil {
+				var dec struct {
+					NeedsPlan string `json:"needs_plan"`
+				}
+				if json.Unmarshal([]byte(resp.Text), &dec) == nil && dec.NeedsPlan == "no" {
+					if traceEnabled.Load() {
+						fmt.Printf("  [plan] %s decided: direct execute\n", decisionModel)
+					}
+					return nil
+				}
+			}
+		}
+		return agentgo.DefaultPlan(ctx, a)
+	}
+
+	ag := agentgo.New[ChatStats](
+		agentgo.WithID[ChatStats]("luachat-root"),
+		agentgo.WithProject[ChatStats]("luachat"),
+		agentgo.WithGateway[ChatStats](gw),
+		agentgo.WithModel[ChatStats](chatModel),
+		agentgo.WithStageModel[ChatStats](agentgo.StatusAnalyzing, decisionModel),
+		agentgo.WithStageModel[ChatStats](agentgo.StatusPlanning, chatModel),
+		agentgo.WithStageModel[ChatStats](agentgo.StatusExecuting, decisionModel),
+		agentgo.WithStageModel[ChatStats](agentgo.StatusEscalated, chatModel),
+		agentgo.WithPermissions[ChatStats]("lua.exec", "worker.spawn"),
+		agentgo.WithSystemPrefix[ChatStats](
+			"You are a helpful conversational assistant with self-managed memory (memory_set/get/delete), controllable chat context (chat_inspect/pin/manage/clear), a personal task list (task_add/update/list), inter-agent messaging (agent_send/recv/peers), lua_exec, and spawn_worker. Reply naturally in plain text and use tools only when helpful.",
+		),
+		agentgo.WithWorkspaceTools[ChatStats](),
+		agentgo.WithTools[ChatStats](luaExec, spawnWorker),
+		agentgo.WithToolInvoker[ChatStats](agentgo.LoopToolInvoker{
+			MaxIterations:       8,
+			ReplyModel:          chatModel,
+			ContinueOnToolError: true,
+		}),
+		agentgo.WithPipeline(agentgo.Pipeline[ChatStats]{
+			Analyze:       tracedStage("Analyze", agentgo.DefaultAnalyze[ChatStats]),
+			GatherContext: tracedStage("GatherContext", agentgo.DefaultGatherContext[ChatStats]),
+			Plan:          tracedStage("Plan", adaptivePlan),
+			Execute:       tracedStage("Execute", agentgo.DefaultExecute[ChatStats]),
+			WaitDeps:      tracedStage("WaitDeps", agentgo.DefaultWaitDeps[ChatStats]),
+		}),
+		agentgo.WithHooks(agentgo.Hooks[ChatStats]{
+			OnStep: func(_ agentgo.Context, st *agentgo.LocalState[ChatStats], stepID string, res agentgo.ToolCallResult) {
+				if res.ToolName != "" {
+					st.Update(func(s *ChatStats) { s.ToolRuns++ })
+				}
+				if traceEnabled.Load() {
+					fmt.Printf("  [hook:step] %s done (tool=%q)\n", stepID, res.ToolName)
+				}
+			},
+			OnEscalate: func(_ agentgo.Context, _ *agentgo.LocalState[ChatStats], history []agentgo.AttemptLog) error {
+				if traceEnabled.Load() {
+					fmt.Printf("  [hook:escalate] guardrail triggered after %d attempts\n", len(history))
+				}
+				return nil
+			},
+			OnFail: func(_ agentgo.Context, _ *agentgo.LocalState[ChatStats], err error) {
+				fmt.Printf("  [hook:fail] %v\n", err)
+			},
+		}),
+	)
+	ag.Memory = stats
+	ag.ArgModel = chatModel
+
+	// Log inter-agent Bus traffic when tracing is enabled.
+	ag.EnsureBus().Subscribe("*", func(env agentgo.Envelope) {
+		if traceEnabled.Load() {
+			fmt.Printf("  [bus] %s -> %s (%s): %s\n", env.From, env.To, env.Kind, env.Content)
+		}
+	})
+
+	fmt.Printf("Luachat ready (chat: %s, decision: %s) — MemoryBank, Bus & 4-phase FSM enabled.\n", chatModel, decisionModel)
+	fmt.Println("Commands: /memory, /set <k>=<v>, /tasks, /chat, /compact, /tell <msg>, /peers, /usage, /trace, /exit")
 
 	for {
 		fmt.Print("\nYou> ")
-		if !scanner.Scan() {
+		rawLine, ok := readLine()
+		if !ok {
 			break
 		}
-		line := strings.TrimSpace(scanner.Text())
+		line := strings.TrimSpace(rawLine)
 		if line == "" {
 			continue
 		}
-		switch line {
-		case "/exit", "/quit":
+		switch {
+		case line == "/exit" || line == "/quit":
 			fmt.Printf("\nTotal usage: %+v\n", gw.UsageByProject("luachat"))
 			return
-		case "/usage":
+		case line == "/usage":
 			fmt.Printf("Usage: %+v\n", gw.UsageByProject("luachat"))
 			continue
-		case "/trace":
+		case line == "/trace":
 			next := !traceEnabled.Load()
 			traceEnabled.Store(next)
 			fmt.Printf("Trace logging: %v\n", next)
 			continue
-		case "/state":
-			b, _ := json.MarshalIndent(ag.State, "", "  ")
-			fmt.Printf("Agent State:\n%s\n", string(b))
+		case line == "/memory":
+			b, _ := json.MarshalIndent(ag.EnsureBank().Entries(), "", "  ")
+			fmt.Printf("MemoryBank Facts:\n%s\nStats: %+v\n", string(b), ag.Memory.Get())
 			continue
-		case "/memory":
-			b, _ := json.MarshalIndent(ag.Memory.Get(), "", "  ")
-			fmt.Printf("Agent Memory:\n%s\n", string(b))
+		case strings.HasPrefix(line, "/set "):
+			kv := strings.SplitN(strings.TrimPrefix(line, "/set "), "=", 2)
+			if len(kv) != 2 {
+				fmt.Println("Usage: /set key=value")
+				continue
+			}
+			ag.EnsureBank().Set(strings.TrimSpace(kv[0]), strings.TrimSpace(kv[1]), "user")
+			fmt.Printf("Saved %q to agent MemoryBank.\n", strings.TrimSpace(kv[0]))
+			continue
+		case line == "/tasks":
+			b, _ := json.MarshalIndent(ag.EnsureBank().Tasks(), "", "  ")
+			fmt.Printf("Agent Tasks:\n%s\n", string(b))
+			continue
+		case line == "/chat":
+			for _, ce := range ag.EnsureBank().ChatEntries() {
+				pin := ""
+				if ce.Pinned {
+					pin = " [pinned]"
+				}
+				fmt.Printf("  %s (%s)%s: %s\n", ce.ID, ce.Message.Role, pin, ce.Message.Content)
+			}
+			continue
+		case line == "/compact":
+			n := ag.EnsureBank().CompactChat("Earlier conversation compacted by user.", 4)
+			fmt.Printf("Compacted %d older messages.\n", n)
+			continue
+		case strings.HasPrefix(line, "/tell "):
+			msg := strings.TrimSpace(strings.TrimPrefix(line, "/tell "))
+			_, _ = ag.Tell("user-cli", msg)
+			fmt.Println("Queued event into agent Bus inbox (will be processed on next turn).")
+			continue
+		case line == "/peers":
+			fmt.Printf("Bus peers: %v\n", ag.EnsureBus().Peers())
 			continue
 		}
 
-		state.Update(func(s *ChatState) {
-			s.History = append(s.History, gateway.Message{Role: gateway.MsgUser, Content: line})
-		})
-
-		out, err := ag.Run(context.Background())
-		if err != nil {
-			fmt.Printf("Error: %v\n", err)
-			continue
+		fmt.Print("AI> ")
+		var streamed bool
+		for delta, err := range ag.StreamChat(context.Background(), line) {
+			if err != nil {
+				fmt.Printf("\nError: %v\n", err)
+				streamed = true
+				break
+			}
+			fmt.Print(delta)
+			streamed = true
 		}
-		reply := fmt.Sprint(out)
-		state.Update(func(s *ChatState) {
-			s.History = append(s.History, gateway.Message{Role: gateway.MsgAssistant, Content: reply})
-		})
-		fmt.Printf("AI> %s\n", reply)
+		if streamed {
+			fmt.Println()
+		}
 	}
 }
 
@@ -386,7 +447,7 @@ func runFullLua(parent context.Context, code string, timeout time.Duration) (map
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
-	L := lua.NewState() // all standard libraries enabled
+	L := lua.NewState()
 	defer L.Close()
 	L.SetContext(ctx)
 

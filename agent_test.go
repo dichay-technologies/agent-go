@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -74,9 +75,6 @@ func TestAgentFullLifecycle(t *testing.T) {
 	}
 	if out != `echo:{"msg":"hello"}` {
 		t.Fatalf("unexpected output: %v", out)
-	}
-	if ag.State.Status != StatusDone {
-		t.Fatalf("expected StatusDone, got %s", ag.State.Status)
 	}
 	st := ag.Memory.Get()
 	if st.StepsCompleted != 1 || st.LastOutput != "echo" {
@@ -154,8 +152,8 @@ func TestAgentGuardrailEscalationAndFail(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "escalation failed") {
 			t.Fatalf("expected escalation failed error, got: %v", err)
 		}
-		if ag.State.Status != StatusFailed || !ag.Memory.Get().Failed {
-			t.Fatalf("expected StatusFailed and OnFail hook, status=%s mem=%+v", ag.State.Status, ag.Memory.Get())
+		if !ag.Memory.Get().Failed {
+			t.Fatalf("expected OnFail hook, mem=%+v", ag.Memory.Get())
 		}
 	})
 }
@@ -171,15 +169,16 @@ func TestAgentSpawnAsyncSemaphoreAndDepth(t *testing.T) {
 		Memory:            NewLocalState(appState{}),
 	}
 
-	ctx := NewContext(context.Background(), ContextConfig{Agent: root})
+	sess := newRunSession(root, RunState{}, nil)
+	ctx := NewContext(context.WithValue(context.Background(), runSessionKey{}, sess), ContextConfig{Agent: root, RunStateFn: sess.snapshot})
 	var futs []*Future
 	for i := range 12 {
 		child := &AI[appState]{
-			ID:           "child",
-			ParentAgent:  root,
-			SkipPlanning: true,
-			Task:         "work",
-			State:        AgentState{SpawnDepth: root.State.SpawnDepth + 1},
+			ID:             "child",
+			ParentAgent:    root,
+			SkipPlanning:   true,
+			Task:           "work",
+			BaseSpawnDepth: 1,
 			Tools: []Tool{stubTool{
 				name: "noop",
 			}},
@@ -217,9 +216,9 @@ func TestAgentSpawnAsyncSemaphoreAndDepth(t *testing.T) {
 
 	// Fork-bomb depth guard check.
 	deep := &AI[appState]{
-		ID:            "deep",
-		MaxSpawnDepth: 2,
-		State:         AgentState{SpawnDepth: 2},
+		ID:             "deep",
+		MaxSpawnDepth:  2,
+		BaseSpawnDepth: 2,
 	}
 	if _, err := deep.SpawnAsync(ctx, "too-deep", root); err == nil || !strings.Contains(err.Error(), "max spawn depth") {
 		t.Fatalf("expected max spawn depth error, got: %v", err)
@@ -244,12 +243,19 @@ func TestAgentMultiStepPlanDAG(t *testing.T) {
 		}
 	}))
 
+	var lastPlan []PlanStep
 	ag := &AI[appState]{
-		ID:        "dag-agent",
-		Gateway:   gw,
-		Model:     "m1",
-		PlanModel: "m-plan",
-		Task:      "build report",
+		ID:         "dag-agent",
+		Gateway:    gw,
+		Model:      "m1",
+		PlanModel:  "m-plan",
+		Task:       "build report",
+		EnablePlan: true,
+		Hooks: Hooks[appState]{
+			OnStep: func(ctx Context, _ *LocalState[appState], _ string, _ ToolCallResult) {
+				lastPlan = ctx.RunState().Plan
+			},
+		},
 	}
 
 	out, err := ag.Run(context.Background())
@@ -259,8 +265,8 @@ func TestAgentMultiStepPlanDAG(t *testing.T) {
 	if out != "final-processed" {
 		t.Fatalf("expected final-processed, got: %v", out)
 	}
-	if len(ag.State.Plan) != 2 || ag.State.Status != StatusDone {
-		t.Fatalf("unexpected plan/status: plan=%+v status=%s", ag.State.Plan, ag.State.Status)
+	if len(lastPlan) != 2 {
+		t.Fatalf("unexpected plan: %+v", lastPlan)
 	}
 }
 
@@ -279,8 +285,8 @@ func TestNewOptionsForkAndPipelineOverride(t *testing.T) {
 		WithTask[appState]("custom-task"),
 		WithPipeline(Pipeline[appState]{
 			Analyze: func(_ Context, _ *AI[appState]) error { return nil },
-			Plan: func(_ Context, a *AI[appState]) error {
-				a.State.Plan = []PlanStep{{ID: "p1", Task: "custom-step"}}
+			Plan: func(ctx Context, a *AI[appState]) error {
+				SetPlan(ctx, a, []PlanStep{{ID: "p1", Task: "custom-step"}})
 				return nil
 			},
 		}),
@@ -295,9 +301,9 @@ func TestNewOptionsForkAndPipelineOverride(t *testing.T) {
 	}
 
 	child := Fork[appState, appState](root, WithID[appState]("child"), WithSkipPlanning[appState](true), WithTask[appState]("sub"))
-	if child.Parent() != root || child.State.SpawnDepth != 1 || child.Gateway != gw || child.ProjectID != "proj-lib" {
+	if child.Parent() != root || child.BaseSpawnDepth != 1 || child.Gateway != gw || child.ProjectID != "proj-lib" {
 		t.Fatalf("Fork did not inherit expected fields: parent=%v depth=%d gw=%v proj=%q",
-			child.Parent(), child.State.SpawnDepth, child.Gateway, child.ProjectID)
+			child.Parent(), child.BaseSpawnDepth, child.Gateway, child.ProjectID)
 	}
 	cout, err := child.Run(context.Background())
 	if err != nil {
@@ -308,3 +314,368 @@ func TestNewOptionsForkAndPipelineOverride(t *testing.T) {
 	}
 }
 
+func TestForkInheritsToolsAndActiveFuturesCleanup(t *testing.T) {
+	echoTool := NewTypedTool(
+		"echo",
+		"echoes input",
+		&gateway.JSONSchema{Type: "object"},
+		false,
+		func(_ Context, in map[string]any) (any, error) { return in, nil },
+	)
+	altTool := NewTypedTool(
+		"alt",
+		"alt tool",
+		&gateway.JSONSchema{Type: "object"},
+		false,
+		func(_ Context, in map[string]any) (any, error) { return in, nil },
+	)
+	inv := ToolInvokerFunc(func(_ Context, req ToolCallRequest) (ToolCallResult, error) {
+		return ToolCallResult{Selected: false, Text: fmt.Sprintf("tools=%d arg=%s", len(req.Tools), req.ArgModel)}, nil
+	})
+
+	root := New[appState](
+		WithID[appState]("root"),
+		WithTools[appState](echoTool),
+		WithToolInvoker[appState](inv),
+	)
+	root.ArgModel = "arg-m"
+
+	inherited := Fork[appState, appState](root, WithID[appState]("inherited"), WithSkipPlanning[appState](true))
+	if len(inherited.Tools) != 1 || inherited.Tools[0].Name() != "echo" {
+		t.Fatalf("expected inherited Tools=[echo], got %v", inherited.Tools)
+	}
+	if inherited.ToolInvoker == nil || inherited.ArgModel != "arg-m" {
+		t.Fatalf("expected inherited ToolInvoker and ArgModel=arg-m, got inv=%v arg=%q", inherited.ToolInvoker, inherited.ArgModel)
+	}
+
+	overridden := Fork[appState, appState](root, WithID[appState]("overridden"), WithTools[appState](altTool))
+	if len(overridden.Tools) != 1 || overridden.Tools[0].Name() != "alt" {
+		t.Fatalf("expected overridden Tools=[alt], got %v", overridden.Tools)
+	}
+
+	sess := newRunSession(root, RunState{}, nil)
+	ctx := NewContext(context.WithValue(context.Background(), runSessionKey{}, sess), ContextConfig{Agent: root, RunStateFn: sess.snapshot})
+	fut, err := root.SpawnAsync(ctx, "c1", inherited)
+	if err != nil {
+		t.Fatalf("SpawnAsync failed: %v", err)
+	}
+	out, err := fut.Await(ctx)
+	if err != nil {
+		t.Fatalf("Await failed: %v", err)
+	}
+	if out != "tools=1 arg=arg-m" {
+		t.Fatalf("unexpected child output: %v", out)
+	}
+	if err := root.WaitDeps(ctx); err != nil {
+		t.Fatalf("WaitDeps failed: %v", err)
+	}
+	sess.mu.Lock()
+	remaining := len(sess.activeFutures)
+	status := sess.state.Status
+	sess.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("expected activeFutures to be empty after child completion, got %d", remaining)
+	}
+	if status == StatusWaitingDeps {
+		t.Fatalf("expected WaitDeps not to transition to StatusWaitingDeps when no futures are active")
+	}
+}
+
+type stubDataSource struct {
+	name    string
+	content string
+}
+
+func (s stubDataSource) Name() string                  { return s.name }
+func (s stubDataSource) Content(_ Context) (string, error) { return s.content, nil }
+
+func TestGatherContextPassedToExecute(t *testing.T) {
+	var seenSys string
+	var seenMsgs []gateway.Message
+	inv := ToolInvokerFunc(func(_ Context, req ToolCallRequest) (ToolCallResult, error) {
+		seenSys = req.SystemPrefix
+		seenMsgs = req.Messages
+		return ToolCallResult{Selected: false, Text: "ok"}, nil
+	})
+	dummyTool := NewTypedTool("noop", "noop", &gateway.JSONSchema{Type: "object"}, false, func(_ Context, _ map[string]any) (any, error) {
+		return nil, nil
+	})
+
+	ag := New[appState](
+		WithID[appState]("ctx-exec"),
+		WithSystemPrefix[appState]("sys-base"),
+		WithData[appState](stubDataSource{name: "chat_history", content: "user: prev\nassistant: answer"}),
+		WithTools[appState](dummyTool),
+		WithToolInvoker[appState](inv),
+		WithTask[appState]("follow up"),
+	)
+
+	out, err := ag.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	if out != "ok" {
+		t.Fatalf("unexpected output: %v", out)
+	}
+	if seenSys != "sys-base" {
+		t.Fatalf("expected SystemPrefix to remain stable as %q, got: %q", "sys-base", seenSys)
+	}
+	if len(seenMsgs) < 2 || !strings.Contains(seenMsgs[0].Content, "user: prev\nassistant: answer") {
+		t.Fatalf("expected gathered context in separate user message, got: %+v", seenMsgs)
+	}
+}
+
+
+type panicAgent struct{}
+
+func (panicAgent) Run(_ context.Context) (any, error) {
+	panic("boom")
+}
+func (panicAgent) Parent() Agent { return nil }
+
+func TestFutureAndSpawnAsyncRecoverPanic(t *testing.T) {
+	fut := NewFuture(context.Background(), "panic-fut", panicAgent{})
+	if _, err := fut.Await(context.Background()); err == nil || !strings.Contains(err.Error(), "panic") {
+		t.Fatalf("expected panic error from NewFuture, got: %v", err)
+	}
+
+	parent := New[appState](WithID[appState]("parent"))
+	ctx := NewContext(context.Background(), ContextConfig{Agent: parent})
+	sfut, err := parent.SpawnAsync(ctx, "panic-child", panicAgent{})
+	if err != nil {
+		t.Fatalf("SpawnAsync failed: %v", err)
+	}
+	if _, err := sfut.Await(context.Background()); err == nil || !strings.Contains(err.Error(), "panic") {
+		t.Fatalf("expected panic error from SpawnAsync, got: %v", err)
+	}
+}
+
+func TestSpawnAsyncUniqueUnnamedKeys(t *testing.T) {
+	parent := New[appState](WithID[appState]("parent-seq"), WithLimits[appState](10, 5, 1))
+	sess := newRunSession(parent, RunState{}, nil)
+	ctx := NewContext(context.WithValue(context.Background(), runSessionKey{}, sess), ContextConfig{Agent: parent, RunStateFn: sess.snapshot})
+
+	gate := make(chan struct{})
+	slowChild := &stubAgent{fn: func(c context.Context) (any, error) {
+		<-gate
+		return "done", nil
+	}}
+	fastChild := &stubAgent{fn: func(c context.Context) (any, error) {
+		return "fast", nil
+	}}
+
+	f1, err := parent.SpawnAsync(ctx, "", slowChild)
+	if err != nil {
+		t.Fatalf("spawn 1: %v", err)
+	}
+	f2, err := parent.SpawnAsync(ctx, "", fastChild)
+	if err != nil {
+		t.Fatalf("spawn 2: %v", err)
+	}
+	if _, err := f2.Await(context.Background()); err != nil {
+		t.Fatalf("await f2: %v", err)
+	}
+	// Spawn a 3rd unnamed child while f1 is still active and f2 was deleted.
+	f3, err := parent.SpawnAsync(ctx, "", slowChild)
+	if err != nil {
+		t.Fatalf("spawn 3: %v", err)
+	}
+
+	sess.mu.Lock()
+	activeCount := len(sess.activeFutures)
+	sess.mu.Unlock()
+	if activeCount != 2 {
+		t.Fatalf("expected 2 active futures without key collision, got %d", activeCount)
+	}
+
+	close(gate)
+	if err := parent.WaitDeps(ctx); err != nil {
+		t.Fatalf("WaitDeps: %v", err)
+	}
+	if _, err := f1.Await(context.Background()); err != nil {
+		t.Fatalf("await f1: %v", err)
+	}
+	if _, err := f3.Await(context.Background()); err != nil {
+		t.Fatalf("await f3: %v", err)
+	}
+}
+
+func TestWaitDepsCanceledContext(t *testing.T) {
+	parent := New[appState](WithID[appState]("parent-cancel"))
+	cctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ctx := NewContext(cctx, ContextConfig{Agent: parent})
+	if err := parent.WaitDeps(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got: %v", err)
+	}
+}
+
+func TestAgentConcurrentReuseAndRunFrom(t *testing.T) {
+	var calls atomic.Int32
+	gw := gateway.New(gateway.Config{})
+	gw.Register("mock", mock.New("mock", func(_ context.Context, req gateway.Request) (gateway.Response, error) {
+		calls.Add(1)
+		msg := req.Messages[len(req.Messages)-1].Content
+		return gateway.Response{Text: "resp:" + msg}, nil
+	}))
+
+	ag := FromConfig(Config[appState]{
+		ID:      "reusable",
+		Gateway: gw,
+		Model:   "m1",
+		Task:    "hello",
+	})
+
+	// Run twice concurrently on the same immutable AI[S].
+	errCh := make(chan error, 2)
+	for range 2 {
+		go func() {
+			out, err := ag.Run(context.Background())
+			if err == nil && out != "resp:hello" {
+				err = fmt.Errorf("unexpected output: %v", out)
+			}
+			errCh <- err
+		}()
+	}
+	for range 2 {
+		if err := <-errCh; err != nil {
+			t.Fatalf("concurrent Run failed: %v", err)
+		}
+	}
+
+	// Resume from a partially completed RunState: s1 already done, only s2 should run.
+	calls.Store(0)
+	resumed, err := ag.RunFrom(context.Background(), RunState{
+		Plan: []PlanStep{
+			{ID: "s1", Task: "step-one"},
+			{ID: "s2", Task: "step-two", DependsOn: []string{"s1"}},
+		},
+		StepResults: map[string]any{"s1": "cached-s1"},
+	})
+	if err != nil {
+		t.Fatalf("RunFrom failed: %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("expected only 1 model call on resume (s2), got %d", calls.Load())
+	}
+	if !strings.Contains(fmt.Sprint(resumed), "s1: cached-s1") {
+		t.Fatalf("expected resumed s2 to receive s1 output, got: %v", resumed)
+	}
+}
+
+func TestDAGParallelSchedulerAndFailurePolicy(t *testing.T) {
+	var active, maxConc atomic.Int32
+	gw := gateway.New(gateway.Config{})
+	gw.Register("mock", mock.New("mock", func(_ context.Context, req gateway.Request) (gateway.Response, error) {
+		cur := active.Add(1)
+		for {
+			prev := maxConc.Load()
+			if cur <= prev || maxConc.CompareAndSwap(prev, cur) {
+				break
+			}
+		}
+		time.Sleep(15 * time.Millisecond)
+		active.Add(-1)
+		msg := req.Messages[len(req.Messages)-1].Content
+		if strings.HasPrefix(msg, "flaky") {
+			return gateway.Response{}, errors.New("boom")
+		}
+		return gateway.Response{Text: "ok:" + msg}, nil
+	}))
+
+	ag := FromConfig(Config[appState]{
+		ID:            "dag-par",
+		Gateway:       gw,
+		Model:         "m1",
+		MaxAttempts:   1,
+		Scheduler:     DAGParallelScheduler{MaxConcurrency: 2},
+		FailurePolicy: FallbackValue("fallback-val"),
+		Pipeline: Pipeline[appState]{
+			Plan: func(ctx Context, a *AI[appState]) error {
+				SetPlan(ctx, a, []PlanStep{
+					{ID: "a", Task: "task-a"},
+					{ID: "b", Task: "task-b"},
+					{ID: "c", Task: "flaky"},
+				})
+				return nil
+			},
+		},
+	})
+
+	out, err := ag.Run(context.Background())
+	if err != nil {
+		t.Fatalf("DAGParallel Run failed: %v", err)
+	}
+	if maxConc.Load() < 2 {
+		t.Fatalf("expected parallel execution (>=2 concurrent), got maxConc=%d", maxConc.Load())
+	}
+	if out == nil {
+		t.Fatalf("expected non-nil output")
+	}
+}
+
+func TestLoopToolInvokerFuncMiddlewareAndRunAs(t *testing.T) {
+	type addIn struct {
+		A int `json:"a" desc:"first"`
+		B int `json:"b" desc:"second"`
+	}
+	type calcOut struct {
+		Sum int `json:"sum"`
+	}
+
+	var turn atomic.Int32
+	gw := gateway.New(gateway.Config{})
+	gw.Register("mock", mock.New("mock", func(_ context.Context, req gateway.Request) (gateway.Response, error) {
+		if turn.Add(1) == 1 {
+			return gateway.Response{
+				ToolCalls: []gateway.ToolCall{{
+					ID:        "tc1",
+					Name:      "add",
+					Arguments: json.RawMessage(`{"a":2,"b":3}`),
+				}},
+			}, nil
+		}
+		// Second turn sees MsgTool result and returns JSON matching calcOut.
+		last := req.Messages[len(req.Messages)-1]
+		if last.Role != gateway.MsgTool || last.Content != "5" {
+			return gateway.Response{}, fmt.Errorf("expected MsgTool=5, got %+v", last)
+		}
+		return gateway.Response{Text: `{"sum":5}`}, nil
+	}))
+
+	var mwCalled bool
+	mw := func(next ToolInvoker) ToolInvoker {
+		return ToolInvokerFunc(func(ctx Context, req ToolCallRequest) (ToolCallResult, error) {
+			mwCalled = true
+			return next.Invoke(ctx, req)
+		})
+	}
+
+	addTool := Func("add", "adds two numbers", func(_ Context, in addIn) (int, error) {
+		return in.A + in.B, nil
+	})
+
+	ag := FromConfig(Config[appState]{
+		ID:              "react-calc",
+		Gateway:         gw,
+		Model:           "m1",
+		Task:            "add 2 and 3",
+		Tools:           []Tool{addTool},
+		ToolInvoker:     LoopToolInvoker{MaxIterations: 5},
+		ToolMiddlewares: []ToolMiddleware{mw},
+	})
+
+	res, err := RunAs[calcOut](context.Background(), ag)
+	if err != nil {
+		t.Fatalf("RunAs failed: %v", err)
+	}
+	if !mwCalled {
+		t.Fatalf("expected ToolMiddleware to be called")
+	}
+	if res.Sum != 5 {
+		t.Fatalf("expected Sum=5, got %+v", res)
+	}
+	if !strings.Contains(Untrusted("hi"), "<untrusted_data>") {
+		t.Fatalf("Untrusted helper did not wrap text")
+	}
+}

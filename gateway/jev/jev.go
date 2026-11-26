@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -34,9 +35,14 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("jev: HTTP %d: %s", e.Status, e.Body)
 }
 
-// Retryable reports whether the error (429 / 529) can be retried.
+// Unwrap exposes typed gateway.ProviderError categories.
+func (e *APIError) Unwrap() error {
+	return gateway.ClassifyStatusCode("jev", e.Status, e.Body)
+}
+
+// Retryable reports whether the error (429 / 5xx) can be retried.
 func (e *APIError) Retryable() bool {
-	return e.Status == http.StatusTooManyRequests || e.Status == 529
+	return e.Status == http.StatusTooManyRequests || e.Status >= 500
 }
 
 // Config configures the standalone TypeSafe System One (Jev) provider.
@@ -68,6 +74,9 @@ type Provider struct {
 
 // New creates a standalone Jev Provider.
 func New(cfg Config) (*Provider, error) {
+	if cfg.APIKey == "" {
+		cfg.APIKey = os.Getenv("TYPESAFE_API_KEY")
+	}
 	if cfg.APIKey == "" {
 		return nil, fmt.Errorf("jev: APIKey is required")
 	}

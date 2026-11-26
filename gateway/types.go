@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"iter"
 )
 
 // MessageRole represents the author of a chat message.
@@ -65,6 +66,9 @@ type ToolCall struct {
 type Request struct {
 	// ProjectID tags the request for per-project token accounting, quotas, and routing.
 	ProjectID string
+	// Meta carries arbitrary developer-defined tags (e.g. user_id, run_id, tenant)
+	// for UsageSink accounting and middleware without hardcoding schema fields.
+	Meta map[string]string
 	// Provider optionally selects a registered provider by name.
 	// If empty, AIGateway resolves it via its ModelRouter.
 	Provider string
@@ -128,5 +132,31 @@ type Provider interface {
 type BatchProvider interface {
 	Provider
 	BatchComplete(ctx context.Context, reqs []Request) ([]Response, []error)
+}
+
+// StreamChunk represents a single incremental delta from a streaming provider.
+type StreamChunk struct {
+	Text      string
+	ToolCalls []ToolCall
+	Usage     *Usage
+	Done      bool
+}
+
+// StreamProvider is an optional interface for providers that support streaming responses.
+type StreamProvider interface {
+	Provider
+	Stream(ctx context.Context, req Request) iter.Seq2[StreamChunk, error]
+}
+
+// UsageSink receives token usage events for custom accounting or telemetry.
+type UsageSink interface {
+	Record(ctx context.Context, req Request, usage Usage)
+}
+
+// UsageSinkFunc adapts a function to UsageSink.
+type UsageSinkFunc func(ctx context.Context, req Request, usage Usage)
+
+func (f UsageSinkFunc) Record(ctx context.Context, req Request, usage Usage) {
+	f(ctx, req, usage)
 }
 
