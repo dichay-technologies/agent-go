@@ -72,7 +72,7 @@ func (t *HTTPTransport) RoundTrip(ctx context.Context, payload []byte) ([]byte, 
 	if err != nil {
 		return nil, fmt.Errorf("mcp http: request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if newSID := resp.Header.Get("Mcp-Session-Id"); newSID != "" {
 		t.mu.Lock()

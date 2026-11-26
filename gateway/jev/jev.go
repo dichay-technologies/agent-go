@@ -187,7 +187,7 @@ func (p *Provider) doOnce(ctx context.Context, endpoint string, body []byte) ([]
 	if err != nil {
 		return nil, fmt.Errorf("jev: request failed: %w", err)
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 
 	data, err := io.ReadAll(io.LimitReader(res.Body, 8<<20))
 	if err != nil {

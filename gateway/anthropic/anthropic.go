@@ -176,7 +176,7 @@ func (p *Provider) Stream(ctx context.Context, req gateway.Request) iter.Seq2[ga
 			yield(gateway.StreamChunk{}, fmt.Errorf("anthropic: stream request failed: %w", err))
 			return
 		}
-		defer res.Body.Close()
+		defer func() { _ = res.Body.Close() }()
 
 		if res.StatusCode < 200 || res.StatusCode >= 300 {
 			errBody, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
@@ -369,6 +369,7 @@ func (p *Provider) batchNative(ctx context.Context, reqs []gateway.Request) ([]g
 	defer ticker.Stop()
 	var resultsURL string
 
+pollLoop:
 	for {
 		select {
 		case <-ctx.Done():
@@ -387,11 +388,8 @@ func (p *Provider) batchNative(ctx context.Context, reqs []gateway.Request) ([]g
 			}
 			if st.ProcessingStatus == "ended" {
 				resultsURL = st.ResultsURL
-				break
+				break pollLoop
 			}
-		}
-		if resultsURL != "" {
-			break
 		}
 	}
 
@@ -488,7 +486,7 @@ func (p *Provider) doOnce(ctx context.Context, method, endpoint string, headers 
 	if err != nil {
 		return nil, fmt.Errorf("anthropic: request failed: %w", err)
 	}
-	defer res.Body.Close()
+	defer func() { _ = res.Body.Close() }()
 
 	data, err := io.ReadAll(io.LimitReader(res.Body, 16<<20))
 	if err != nil {

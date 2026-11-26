@@ -240,7 +240,7 @@ func (p *Provider) Stream(ctx context.Context, req gateway.Request) iter.Seq2[ga
 			yield(gateway.StreamChunk{}, err)
 			return
 		}
-		defer httpResp.Body.Close()
+		defer func() { _ = httpResp.Body.Close() }()
 
 		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 			errBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
@@ -391,7 +391,7 @@ func (p *Provider) doHTTP(ctx context.Context, method, suffix string, extraHeade
 	if err != nil {
 		return nil, fmt.Errorf("cloudflare (%s): request failed: %w", p.dialect.Name(), err)
 	}
-	defer httpResp.Body.Close()
+	defer func() { _ = httpResp.Body.Close() }()
 
 	respBody, err := io.ReadAll(io.LimitReader(httpResp.Body, 16<<20))
 	if err != nil {

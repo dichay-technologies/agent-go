@@ -189,7 +189,7 @@ func (p *Provider) Stream(ctx context.Context, req gateway.Request) iter.Seq2[ga
 			yield(gateway.StreamChunk{}, fmt.Errorf("openai: stream request failed: %w", err))
 			return
 		}
-		defer httpResp.Body.Close()
+		defer func() { _ = httpResp.Body.Close() }()
 
 		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 			errBody, _ := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))

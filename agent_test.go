@@ -210,6 +210,9 @@ func TestAgentSpawnAsyncSemaphoreAndDepth(t *testing.T) {
 	if err := root.WaitDeps(ctx); err != nil {
 		t.Fatalf("WaitDeps failed: %v", err)
 	}
+	if len(futs) != 12 {
+		t.Fatalf("expected 12 futures, got %d", len(futs))
+	}
 	if maxObserved.Load() > 4 {
 		t.Fatalf("semaphore breached: maxObserved=%d > 4", maxObserved.Load())
 	}

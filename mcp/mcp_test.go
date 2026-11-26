@@ -156,7 +156,7 @@ func TestMCPStdioTransport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStdioTransport: %v", err)
 	}
-	defer tr.Close()
+	defer func() { _ = tr.Close() }()
 
 	client := mcp.NewClient(tr)
 	descs, err := client.ListTools(context.Background())

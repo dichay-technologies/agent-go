@@ -137,11 +137,7 @@ func newRunSession[S any](a *AI[S], initial RunState, sc *spawnContext) *runSess
 func (s *runSession[S]) snapshot() RunState {
 	s.mu.Lock()
 	st := s.state.Clone()
-	bus := s.bus
 	s.mu.Unlock()
-	if bus != nil {
-		// Reflect unread inbox messages alongside drained events without mutating the mailbox.
-	}
 	return st
 }
 
