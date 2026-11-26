@@ -533,7 +533,7 @@ func (p *Provider) doOnce(ctx context.Context, method, endpoint, contentType str
 	if err != nil {
 		return nil, fmt.Errorf("openai: request failed: %w", err)
 	}
-	defer httpResp.Body.Close()
+	defer func() { _ = httpResp.Body.Close() }()
 
 	respBody, err := io.ReadAll(io.LimitReader(httpResp.Body, 16<<20))
 	if err != nil {
